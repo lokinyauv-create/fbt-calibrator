@@ -1,0 +1,4 @@
+#!/bin/bash
+# Tracker Calibration launcher (works from the source tree and from ~/.local/share/fbt-calibrator).
+HERE="$(dirname "$(readlink -f "$0")")"
+cd "$HERE/app" && exec "$HERE/.venv/bin/python" -m fbtcal.main "$@"
