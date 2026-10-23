@@ -11,6 +11,8 @@ Full-body tracker calibration for **SteamVR on Linux**, inspired by the calibrat
 - **T-pose calibration.** Stand straight with your **feet together** and arms out for one second. You hear a camera click. Your waist and foot trackers are now "straight": both feet are symmetric and sit at the ankles, however the trackers are strapped on.
 - **Saved.** Strap the trackers the same way next time and you don't need to calibrate again.
 - **VRChat calibration in any pose.** Press *Calibrate FBT* in VRChat while sitting or lying down. The trackers are held on a perfect T-pose for that moment, so you just pull the trigger.
+- **Trackers stick to the avatar.** While VRChat waits for the trigger, the trackers follow your head, so turning or looking down doesn't move them off the avatar. They are placed for the height VRChat uses, so they land on the avatar's hips and feet.
+- **Height check.** If VRChat's *Real height* is far from the height measured in the T-pose, the window tells you which number to set.
 - **Feet width** for VRChat calibration (*Feet closer / wider*). Use it if the avatar's thighs splay out or cross.
 - Optional dots in VR showing where the calibrated trackers are.
 - **Update button.** It installs the latest GitHub release.
@@ -31,7 +33,8 @@ Needs: Linux, native SteamVR, `python3`. The installer fetches `openvr`, `numpy`
 
 1. **Calibrate once:** stand straight, feet **together** (touching), look ahead and hold your arms out (T-pose). After about 1 s you hear a camera click 📸. A warning sound means a tracker wasn't visible or your feet were apart.
 2. **VRChat:** turn on **Settings → Tracking & IK → IK Debug Logging** and **One Handed Calibration**. Then press *Calibrate FBT* in any pose. You hear a bell 🔔 and the trackers stand straight. Pull the trigger, and you hear a "done" sound when the trackers follow you again.
-3. If the legs look wrong, change the **feet width** in the window and calibrate in VRChat again.
+3. If the window shows a height warning, set that **Real height** in VRChat (Settings → Tracking & IK).
+4. If the legs look wrong, change the **feet width** in the window and calibrate in VRChat again.
 
 Untick *Calibrate with a T-pose* if you don't want accidental recalibration.
 
