@@ -28,6 +28,10 @@ S = {
               'made with AI (Claude) · <a href="https://github.com/{repo}">GitHub</a>',
               'Версія {v} · автор <a href="https://github.com/lokinyauv-create">Lokinya</a> · '
               'створено ШІ (Claude) · <a href="https://github.com/{repo}">GitHub</a>'),
+    "height_hint": ("⚠️ VRChat thinks you are {vrc} cm tall, the T-pose says ≈{real} cm. "
+                    "Set Real height to {real} cm in VRChat (Settings → Tracking & IK).",
+                    "⚠️ VRChat думає, що твій зріст {vrc} см, а за Т-позою ≈{real} см. "
+                    "Постав {real} см у VRChat (Налаштування → Tracking & IK → Real height)."),
     "tray_open": ("Open", "Відкрити"),
     "tray_quit": ("Quit", "Вийти"),
     "waist": ("Waist", "Пояс"),

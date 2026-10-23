@@ -40,12 +40,16 @@ INTERESTING = re.compile(r"calibrat|\[IK|IKDebug|FBT|FBIK", re.I)
 # Not "Setting controller ... visibility": VRChat logs that on every menu open too.
 START = re.compile(r"\[IK Debug Log\] (Calibrate FBT and reload avatar|Preparing for calibration)\.\.\.")
 END = re.compile(r"\[IK Debug Log\] Restore tracking\.\.\.")
+# "Changed player height... tracking scale:0.6480417 eye height:1.624643" (2026-10-24): the eye
+# height VRChat hangs the avatar from, taken from its "Real height" setting (1.73 m → 1.6246).
+HEIGHT = re.compile(r"Changed player height\.\.\. tracking scale:\s*[\d.]+ eye height:\s*([\d.]+)")
 
 
 class VrchatLogWatcher:
-    def __init__(self, on_start, on_end, log):
+    def __init__(self, on_start, on_end, log, on_height=None):
         self.on_start = on_start
         self.on_end = on_end
+        self.on_height = on_height or (lambda eye: None)
         self.log = log
         self.log_dir = None
         self.path = None
@@ -63,6 +67,7 @@ class VrchatLogWatcher:
         if newest != self.path:
             self.path = newest
             self.pos = newest.stat().st_size  # only new lines
+            self.last_height()
         try:
             with open(self.path, "rb") as f:
                 f.seek(self.pos)
@@ -76,7 +81,22 @@ class VrchatLogWatcher:
         for line in data[:cut].decode("utf-8", "replace").splitlines():
             if INTERESTING.search(line) and "Selfie Expression" not in line:
                 self.log("vrchat: " + line.strip()[:300])
+            m = HEIGHT.search(line)
+            if m:
+                self.on_height(float(m.group(1)))
             if START.search(line):
                 self.on_start()
             elif END.search(line):
                 self.on_end()
+
+    def last_height(self):
+        """VRChat logs the height once per avatar load: pick up the latest one already written."""
+        try:
+            with open(self.path, "rb") as f:
+                f.seek(max(0, self.pos - 4_000_000))
+                tail = f.read(self.pos - f.tell()).decode("utf-8", "replace")
+        except OSError:
+            return
+        found = HEIGHT.findall(tail)
+        if found:
+            self.on_height(float(found[-1]))

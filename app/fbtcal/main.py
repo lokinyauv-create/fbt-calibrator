@@ -40,7 +40,8 @@ def role_name(role):
     return tr(role) if role in B.ROLES else role
 
 
-OVERRIDE_SECONDS = 30.0  # safety net; normally VRChat's "calibration ended" line releases it
+OVERRIDE_SECONDS = 30.0
+VRC_EYE_RATIO = 1.624643 / 1.73  # VRChat's eye height / its "Real height" setting (seen 2026-10-24)  # safety net; normally VRChat's "calibration ended" line releases it
 
 
 def log(msg):
@@ -156,6 +157,7 @@ class Calibrator:
         self.status = {}
         self.last_vr_try = 0.0
         self.std_from_raw = None
+        self.vrc_eye = None  # eye height VRChat uses (from its log), see follow_head
         self.push_slots()
 
     # ---- shared memory ----
@@ -301,10 +303,30 @@ class Calibrator:
         the trigger is pulled, so the trackers stay "magnetised" to it when she turns or nods.
         """
         side = self.settings["stance_cm"] / 200.0
-        model = B.model_points(head, self.eye, head_y=B.level_eye_y(head), ankle_side=side)
+        # VRChat hangs an avatar sized for ITS eye height from the head. Building the T-pose
+        # from that height puts the trackers on the avatar's hips and feet, so they snap on
+        # even when VRChat's "Real height" differs from her real one (173 vs ~161 cm, 2026-10-24).
+        eye = self.vrc_eye or self.eye
+        model = B.model_points(head, eye, head_y=B.level_eye_y(head), ankle_side=side)
         raw_from_std = B.inverse(self.std_from_raw)
         self.override = {s: B.compose(raw_from_std, model[c["role"]]) for s, c in self.cal.items()}
         self.push_slots()
+
+    def set_vrc_eye(self, eye):
+        if eye == self.vrc_eye:
+            return
+        self.vrc_eye = eye
+        msg = "VRChat eye height %.3f m (real height setting ≈ %.0f cm)" % (eye, eye / VRC_EYE_RATIO * 100)
+        if self.eye:
+            msg += ", measured %.3f m → real height ≈ %.0f cm" % (self.eye, self.eye / VRC_EYE_RATIO * 100)
+        log(msg)
+
+    def height_hint(self):
+        """Advice when VRChat's "Real height" is far from the height measured in the T-pose."""
+        if not self.vrc_eye or not self.eye or abs(self.vrc_eye - self.eye) < 0.04:
+            return None
+        return tr("height_hint", vrc=round(self.vrc_eye / VRC_EYE_RATIO * 100),
+                  real=round(self.eye / VRC_EYE_RATIO * 100))
 
     def end_override(self):
         if self.override:
@@ -334,6 +356,7 @@ class Calibrator:
             "tpose": bool(self.settings["tpose"]),
             "dots": bool(self.settings["dots"]),
             "stance_cm": int(self.settings["stance_cm"]),
+            "height_hint": self.height_hint(),
         }
         CACHE.mkdir(parents=True, exist_ok=True)
         tmp = STATUS_FILE.with_suffix(".tmp")
@@ -465,6 +488,9 @@ class Window(QWidget):
             for serial, info in sorted(c.cal.items(), key=lambda kv: kv[1]["role"]):
                 ok = "✅" if serial in seen else "❌"
                 lines.append(f"{ok} {role_name(info['role'])}")
+        hint = c.height_hint()
+        if hint:
+            lines.append(hint)
         if c.override:
             left = max(0, int(c.override_until - time.monotonic()))
             lines.append(tr("frozen", s=left))
@@ -545,7 +571,7 @@ def main():
     win = Window(cal)
 
     watcher = VrchatLogWatcher(on_start=lambda: cal.start_override("VRChat calibration"),
-                               on_end=cal.end_override, log=log)
+                               on_end=cal.end_override, log=log, on_height=cal.set_vrc_eye)
 
     pix = QPixmap(dot_image("#3d8bfd"))
     tray = QSystemTrayIcon(QIcon(pix))
