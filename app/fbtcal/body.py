@@ -9,7 +9,10 @@ import numpy as np
 UP = np.array([0.0, 1.0, 0.0])
 
 # Body model, relative to the head at T-pose time. Heights are fractions of eye height.
-NECK_BACK = 0.07        # eyes sit this far in front of the spine axis (m)
+# The head turns around the neck, not the eyes: looking down moves the eyes ~8 cm forward
+# and down. Everything hangs from this pivot so nodding does not move the body (2026-10-23).
+NECK_UP = 0.11          # eyes sit this far above the neck pivot (m)
+NECK_FWD = 0.08         # ... and this far in front of it, on the spine axis (m)
 WAIST_HEIGHT = 0.56     # × eye height
 ANKLE_HEIGHT = 0.048    # × eye height
 ANKLE_SIDE = 0.06       # half-distance between ankle centres in pencil pose (m)
@@ -89,26 +92,40 @@ def inverse(a):
 
 
 def head_frame(head):
-    """Horizontal forward/right unit vectors from a head pose."""
-    fwd = q_rot(head[1], [0.0, 0.0, -1.0])
-    fwd[1] = 0.0
-    n = np.linalg.norm(fwd)
-    fwd = fwd / n if n > 1e-6 else np.array([0.0, 0.0, -1.0])
+    """Horizontal forward/right unit vectors from a head pose.
+
+    Uses only the yaw part of the rotation (swing-twist about +Y), so looking straight
+    down or up keeps a steady forward instead of flipping.
+    """
+    w, _, y, _ = head[1]
+    n = np.hypot(w, y)
+    yaw = np.array([w / n, 0.0, y / n, 0.0]) if n > 1e-6 else np.array([1.0, 0, 0, 0])
+    fwd = q_rot(yaw, [0.0, 0.0, -1.0])
     right = np.cross(fwd, UP)
     return fwd, right
+
+
+def neck(head):
+    """Neck pivot: the point the head turns around (head-local +Z is backwards)."""
+    return head[0] + q_rot(head[1], [0.0, -NECK_UP, NECK_FWD])
+
+
+def level_eye_y(head):
+    """Eye height the head would have when looking straight ahead."""
+    return float(neck(head)[1] + NECK_UP)
 
 
 def model_points(head, eye_height, head_y=None, ankle_side=ANKLE_SIDE):
     """Ideal joint poses for a straight T-pose with feet together ("pencil pose").
 
     `eye_height` is the standing eye height from calibration. When `head_y` is given
-    (any-pose VRChat calibration), heights are placed relative to the current head
-    instead of the floor, the way VRChat hangs the T-posed avatar from the head.
+    (any-pose VRChat calibration, pass `level_eye_y(head)`), heights are placed relative
+    to the current head instead of the floor, the way VRChat hangs the T-posed avatar from the head.
     `ankle_side` sets how far apart the feet are placed (Standable's "stance").
     """
     fwd, right = head_frame(head)
     rot = q_yaw(fwd)
-    base = head[0] - NECK_BACK * fwd
+    base = neck(head)
     base[1] = 0.0
     lift = 0.0 if head_y is None else head_y - eye_height
 
@@ -149,7 +166,7 @@ def calibrate(head, trackers):
     roles = assign_roles(head, trackers)
     if roles is None:
         return None, None
-    eye = float(head[0][1])
+    eye = level_eye_y(head)
     model = model_points(head, eye)
     result = {}
     for serial, role in roles.items():

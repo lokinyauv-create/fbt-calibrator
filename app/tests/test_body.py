@@ -11,7 +11,7 @@ def test_roundtrip_and_symmetry():
         head = (np.array([rng.uniform(-1,1), 1.55, rng.uniform(-1,1)]),
                 b.q_mul(np.array([np.cos(yaw/2),0,np.sin(yaw/2),0]), b.q_norm(np.array([1,0.05,0,0.03]))))
         fwd, right = b.head_frame(head)
-        base = head[0] - 0.07*fwd; base[1]=0
+        base = b.neck(head); base[1]=0
         trackers = {
             "W": (base + np.array([0,0.9,0]) - 0.1*fwd, rand_q(rng)),
             "L": (base - 0.07*right + 0.08*fwd + np.array([0,0.11,0]), rand_q(rng)),
@@ -41,3 +41,19 @@ def test_any_pose_model_hangs_from_head():
     a = b.model_points(head, 1.55); s = b.model_points(sit, 1.55, head_y=1.05)
     for k in a:
         assert np.allclose(a[k][0] - [0, 0.5, 0], s[k][0])
+
+
+def test_nodding_does_not_move_the_body():
+    """Looking down or up (pitch about the neck) leaves the any-pose model where it was."""
+    level = (np.array([0.3, 1.55, -0.2]), np.array([np.cos(0.4), 0, np.sin(0.4), 0]))
+    pivot = b.neck(level)
+    ref = b.model_points(level, 1.55, head_y=b.level_eye_y(level))
+    for pitch in (-1.4, -0.7, 0.5, 1.4):  # down to nearly straight down, up to nearly straight up
+        rot = b.q_mul(level[1], np.array([np.cos(pitch / 2), np.sin(pitch / 2), 0, 0]))
+        eyes = pivot - b.q_rot(rot, [0.0, -b.NECK_UP, b.NECK_FWD])
+        head = (eyes, rot)
+        assert np.allclose(b.neck(head), pivot)
+        m = b.model_points(head, 1.55, head_y=b.level_eye_y(head))
+        for k in ref:
+            assert np.allclose(m[k][0], ref[k][0], atol=1e-9)
+            assert abs(abs(np.dot(m[k][1], ref[k][1])) - 1) < 1e-9

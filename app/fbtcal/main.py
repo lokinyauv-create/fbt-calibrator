@@ -255,6 +255,8 @@ class Calibrator:
         now = time.monotonic()
         if self.override and now > self.override_until:
             self.end_override()
+        elif self.override:
+            self.follow_head(head)
         if self.settings["tpose"] and not self.override and self.tpose.update(head, left, right, now):
             self.calibrate(head, trackers_real)
         self.update_dots(head, final)
@@ -287,14 +289,22 @@ class Calibrator:
         poses = self.vr.getDeviceToAbsoluteTrackingPose(openvr.TrackingUniverseStanding, 0, 1)
         head = B.mat_to_pose(poses[0].mDeviceToAbsoluteTracking.m)
         self.settings.update(load_json(SETTINGS_FILE, {}))  # may be edited outside the window
-        side = self.settings["stance_cm"] / 200.0
-        model = B.model_points(head, self.eye, head_y=head[0][1], ankle_side=side)
-        raw_from_std = B.inverse(self.std_from_raw)
-        self.override = {s: B.compose(raw_from_std, model[c["role"]]) for s, c in self.cal.items()}
         self.override_until = time.monotonic() + OVERRIDE_SECONDS
-        self.push_slots()
+        self.follow_head(head)
         play("bell.oga")
         log(f"trackers frozen on ideal T-pose ({reason})")
+
+    def follow_head(self, head):
+        """Put the frozen trackers on the ideal T-pose under the current head.
+
+        Called every tick while frozen: VRChat keeps hanging the avatar from the head until
+        the trigger is pulled, so the trackers stay "magnetised" to it when she turns or nods.
+        """
+        side = self.settings["stance_cm"] / 200.0
+        model = B.model_points(head, self.eye, head_y=B.level_eye_y(head), ankle_side=side)
+        raw_from_std = B.inverse(self.std_from_raw)
+        self.override = {s: B.compose(raw_from_std, model[c["role"]]) for s, c in self.cal.items()}
+        self.push_slots()
 
     def end_override(self):
         if self.override:
