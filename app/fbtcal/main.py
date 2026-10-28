@@ -157,6 +157,7 @@ class Calibrator:
         self.override = None
         self.status = {}
         self.last_vr_try = 0.0
+        self.vrserver_quitting = False  # set on SteamVR quit until its vrserver has exited
         self.std_from_raw = None
         self.world_fix = {}  # serial -> what other drivers do to it after ours, see body_pose
         self.vrc_eye = None  # eye height VRChat uses (from its log), see follow_head
@@ -189,6 +190,11 @@ class Calibrator:
         # openvr.init() starts SteamVR when it is not running; after a SteamVR crash that
         # turned into a restart loop (2026-10-20). Only attach to an already-running vrserver.
         if subprocess.run(["pgrep", "-x", "vrserver"], stdout=subprocess.DEVNULL).returncode != 0:
+            self.vrserver_quitting = False
+            return False
+        if self.vrserver_quitting:
+            # Connecting to a vrserver that is shutting down makes vrclient relaunch vrmonitor,
+            # and SteamVR then never finishes quitting (2026-10-28). Wait until it is gone.
             return False
         try:
             self.vr = openvr.init(openvr.VRApplication_Overlay)
@@ -214,7 +220,6 @@ class Calibrator:
         self.vr = None
         self.std_from_raw = None
         self.world_fix = {}
-        self.last_vr_try = time.monotonic() + 10  # let a quitting vrserver exit first
         log("SteamVR closed")
 
     def tick(self):
@@ -226,6 +231,7 @@ class Calibrator:
             if ev.eventType == openvr.VREvent_Quit:
                 self.vr.acknowledgeQuit_Exiting()
                 self.drop_vr()
+                self.vrserver_quitting = True
                 return
 
         n = openvr.k_unMaxTrackedDeviceCount
