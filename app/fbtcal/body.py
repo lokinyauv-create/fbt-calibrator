@@ -19,6 +19,11 @@ ANKLE_SIDE = 0.06       # half-distance between ankle centres in pencil pose (m)
 
 ROLES = ("waist", "left_foot", "right_foot")
 
+# A tracker this close to the eyes rides on the headset (e.g. Space Calibrator's reference
+# for a Quest + Lighthouse mix, 2026-10-28) — it is not a body tracker. The waist sits
+# ~0.6 m below the eyes in a T-pose, so this cannot catch a real one.
+HEAD_MOUNT_RADIUS = 0.30
+
 
 def q_mul(a, b):
     aw, ax, ay, az = a
@@ -141,6 +146,12 @@ def model_points(head, eye_height, head_y=None, ankle_side=ANKLE_SIDE):
     }
 
 
+def body_trackers(head, trackers):
+    """Drop trackers mounted on the headset."""
+    return {s: p for s, p in trackers.items()
+            if np.linalg.norm(p[0] - head[0]) > HEAD_MOUNT_RADIUS}
+
+
 def assign_roles(head, trackers):
     """trackers: {serial: pose}. Highest = waist, the two lowest split left/right."""
     if len(trackers) < 3:
@@ -163,6 +174,7 @@ def feet_together(trackers, roles, max_gap=0.30, max_dy=0.05):
 
 def calibrate(head, trackers):
     """Returns {serial: {"role", "off": (pos, rot)}} and the eye height, or None."""
+    trackers = body_trackers(head, trackers)
     roles = assign_roles(head, trackers)
     if roles is None:
         return None, None

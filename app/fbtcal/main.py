@@ -40,6 +40,7 @@ def role_name(role):
     return tr(role) if role in B.ROLES else role
 
 
+NO_FIX = (np.zeros(3), np.array([1.0, 0, 0, 0]))
 OVERRIDE_SECONDS = 30.0
 VRC_EYE_RATIO = 1.624643 / 1.73  # VRChat's eye height / its "Real height" setting (seen 2026-10-24)  # safety net; normally VRChat's "calibration ended" line releases it
 
@@ -157,6 +158,7 @@ class Calibrator:
         self.status = {}
         self.last_vr_try = 0.0
         self.std_from_raw = None
+        self.world_fix = {}  # serial -> what other drivers do to it after ours, see body_pose
         self.vrc_eye = None  # eye height VRChat uses (from its log), see follow_head
         self.push_slots()
 
@@ -211,6 +213,7 @@ class Calibrator:
             pass
         self.vr = None
         self.std_from_raw = None
+        self.world_fix = {}
         self.last_vr_try = time.monotonic() + 10  # let a quitting vrserver exit first
         log("SteamVR closed")
 
@@ -247,11 +250,11 @@ class Calibrator:
                     right = p
             elif cls == openvr.TrackedDeviceClass_GenericTracker:
                 serial = self.vr.getStringTrackedDeviceProperty(i, openvr.Prop_SerialNumber_String)
-                rp = self.shm.raw_pose(i)
-                if rp is not None:
-                    trackers_real[serial] = B.compose(self.std_from_raw, rp)
                 if std[i].bPoseIsValid:
                     final[serial] = B.mat_to_pose(std[i].mDeviceToAbsoluteTracking.m)
+                    rp = self.shm.raw_pose(i)
+                    if rp is not None:
+                        trackers_real[serial] = self.body_pose(serial, final[serial], rp)
         self.status = {"driver": self.shm.driver_alive(), "seen": set(trackers_real), "final": final}
 
         now = time.monotonic()
@@ -263,11 +266,26 @@ class Calibrator:
             self.calibrate(head, trackers_real)
         self.update_dots(head, final)
 
+    def body_pose(self, serial, final, raw):
+        """Tracker pose in the space apps see, without our own offset.
+
+        Drivers that move trackers after ours (Space Calibrator lining Lighthouse up with a
+        Quest) leave the raw pose our driver reads in another space than the head — 3.85 m
+        and 153° apart on 2026-10-28. Taking our device-local offset back off the final pose
+        works whatever runs before or after us. What is left between raw and that space is
+        kept per tracker so overrides land where apps will show them.
+        """
+        c = self.cal.get(serial)
+        pose = B.compose(final, B.inverse(c["off"])) if c else final
+        if not self.override:  # while frozen the final pose is our override, not the body
+            self.world_fix[serial] = B.compose(pose, B.inverse(B.compose(self.std_from_raw, raw)))
+        return pose
+
     # ---- actions ----
     def calibrate(self, head, trackers_real):
         cal, eye = B.calibrate(head, trackers_real)
         if not cal:
-            log(f"T-pose seen but only {len(trackers_real)} trackers are tracking")
+            log(f"T-pose seen but only {len(B.body_trackers(head, trackers_real))} body trackers are tracking")
             play("dialog-warning.oga")
             return
         roles = {s: c["role"] for s, c in cal.items()}
@@ -309,7 +327,9 @@ class Calibrator:
         eye = self.vrc_eye or self.eye
         model = B.model_points(head, eye, head_y=B.level_eye_y(head), ankle_side=side)
         raw_from_std = B.inverse(self.std_from_raw)
-        self.override = {s: B.compose(raw_from_std, model[c["role"]]) for s, c in self.cal.items()}
+        self.override = {s: B.compose(raw_from_std, B.compose(B.inverse(self.world_fix.get(s, NO_FIX)),
+                                                              model[c["role"]]))
+                         for s, c in self.cal.items()}
         self.push_slots()
 
     def set_vrc_eye(self, eye):
