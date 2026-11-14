@@ -18,7 +18,7 @@ SLOT_SIZE = 184
 RAW_AT = 1496
 RAW_SIZE = 72
 
-PASSTHROUGH, OFFSET, OVERRIDE = 0, 1, 2
+PASSTHROUGH, OFFSET, OVERRIDE, BALANCED = 0, 1, 2, 3
 
 _SLOT = struct.Struct("<64sII3d4d3d4d")
 _RAW = struct.Struct("<IIQ3d4d")
@@ -75,3 +75,68 @@ class Shm:
                 return None
             return np.array(v[0:3]), np.array(v[3:7])
         return None
+
+
+DEV_NAME = "/dev/shm/fbtcal-devices-v2"
+DEV_MAGIC = 0x46424D32
+DEV_AT = 16
+DEV_SIZE = 200
+DEV_COUNT = 24
+HMD, LEFT, RIGHT, TRACKER, OTHER = 1, 2, 3, 4, 5
+_DEV = struct.Struct("<64sIIIIQ3d4d3d4d")
+
+
+class MonadoDevices:
+    """Real poses written by the calibration bridge inside Monado (steamvr_lh/fbtcal.hpp).
+
+    Monado cannot load the SteamVR driver, so there it publishes every device's real pose
+    here (one room space for all) and applies the offsets from the slots in Shm itself.
+    """
+
+    def __init__(self):
+        self.m = None
+
+    def _open(self):
+        if self.m is not None:
+            return True
+        try:
+            fd = os.open(DEV_NAME, os.O_RDONLY)
+        except OSError:
+            return False
+        try:
+            if os.fstat(fd).st_size < DEV_AT + DEV_COUNT * DEV_SIZE:
+                return False
+            self.m = mmap.mmap(fd, DEV_AT + DEV_COUNT * DEV_SIZE, prot=mmap.PROT_READ)
+        finally:
+            os.close(fd)
+        return struct.unpack_from("<I", self.m, 0)[0] == DEV_MAGIC or self._close()
+
+    def _close(self):
+        self.m = None
+        return False
+
+    def alive(self):
+        """True while Monado with the bridge is publishing."""
+        if not self._open():
+            return False
+        hb = struct.unpack_from("<Q", self.m, 8)[0]
+        return bool(hb) and time.monotonic_ns() - hb < 2_000_000_000
+
+    def read(self):
+        """[{serial, kind, pos, rot}] of devices with a fresh valid pose."""
+        out = []
+        if not self._open():
+            return out
+        now = time.monotonic_ns()
+        for i in range(DEV_COUNT):
+            at = DEV_AT + i * DEV_SIZE
+            for _ in range(4):
+                serial, seq, kind, valid, _pad, t, *v = _DEV.unpack_from(self.m, at)
+                if seq & 1 or struct.unpack_from("<I", self.m, at + 64)[0] != seq:
+                    continue
+                if serial[0:1] != b"\0" and valid and now - t < 500_000_000:
+                    out.append({"serial": serial.split(b"\0")[0].decode(errors="replace"), "kind": kind,
+                                "pos": np.array(v[0:3]), "rot": np.array(v[3:7]),
+                                "fpos": np.array(v[7:10]), "frot": np.array(v[10:14])})
+                break
+        return out

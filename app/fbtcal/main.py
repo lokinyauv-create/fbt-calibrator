@@ -6,6 +6,7 @@ offsets at a T-pose, and can freeze the trackers on an ideal T-pose so VRChat
 can calibrate from any pose.
 """
 import json
+import threading
 import os
 import subprocess
 import sys
@@ -16,14 +17,14 @@ import numpy as np
 import openvr
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QAction, QColor, QIcon, QImage, QPainter, QPixmap
-from PySide6.QtWidgets import (QApplication, QCheckBox, QLabel, QMenu, QMessageBox, QPushButton,
-                               QSystemTrayIcon, QVBoxLayout, QHBoxLayout, QWidget)
+from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QHBoxLayout, QLabel, QMenu, QMessageBox, QPushButton,
+                               QSystemTrayIcon, QVBoxLayout, QWidget)
 
 from . import body as B
 from . import update
 from .i18n import tr
 from .version import REPO, VERSION
-from .shm import OFFSET, OVERRIDE, PASSTHROUGH, Shm
+from .shm import BALANCED, HMD, LEFT, OFFSET, OVERRIDE, PASSTHROUGH, RIGHT, TRACKER, MonadoDevices, Shm
 from .vrchat_log import VrchatLogWatcher
 
 CONFIG = Path.home() / ".config/fbt-calibrator"
@@ -31,6 +32,7 @@ CAL_FILE = CONFIG / "calibration.json"
 SETTINGS_FILE = CONFIG / "settings.json"
 CACHE = Path.home() / ".cache/fbt-calibrator"
 LOG_FILE = CONFIG / "fbt-calibrator.log"
+LOG_MAX = 20_000_000  # bytes; the previous log is kept as .old
 SOCKET_NAME = "fbt-calibrator"
 STATUS_FILE = CACHE / "status.json"  # read by the VRN (WayVR) watch panel
 COMMANDS = CACHE / "commands"  # the watch panel drops one small file per button press here
@@ -49,8 +51,17 @@ def log(msg):
     CONFIG.mkdir(parents=True, exist_ok=True)
     line = time.strftime("%Y-%m-%d %H:%M:%S ") + msg
     print(line, flush=True)
+    try:
+        if LOG_FILE.stat().st_size > LOG_MAX:
+            LOG_FILE.replace(LOG_FILE.with_suffix(".log.old"))
+    except OSError:
+        pass
     with open(LOG_FILE, "a") as f:
         f.write(line + "\n")
+
+
+VOICE_DIR = Path(__file__).resolve().parents[2] / "voice"
+_voice_proc = None
 
 
 def play(name):
@@ -95,64 +106,28 @@ def pose_arr(lst):
     return np.array(lst[0]), np.array(lst[1])
 
 
-class TPoseDetector:
-    """Arms out at shoulder height, head level, held still ~1 s."""
-
-    HOLD = 1.0
-
-    def __init__(self):
-        self.since = None
-        self.anchor = None
-        self.armed = True
-
-    def update(self, head, left, right, now):
-        if head is None or left is None or right is None:
-            self.since = None
-            return False
-        eye = head[0][1]
-        fwd, rvec = B.head_frame(head)
-        look = B.q_rot(head[1], [0.0, 0.0, -1.0])
-        arms_down = left[0][1] < eye - 0.6 and right[0][1] < eye - 0.6
-        if arms_down:
-            self.armed = True
-        lx = np.dot(left[0] - head[0], rvec)
-        rx = np.dot(right[0] - head[0], rvec)
-        in_pose = (
-            self.armed
-            and abs(look[1]) < 0.35
-            and eye - 0.45 < left[0][1] < eye + 0.1
-            and eye - 0.45 < right[0][1] < eye + 0.1
-            and lx < -0.45 and rx > 0.45
-            and abs(np.dot(left[0] - head[0], fwd)) < 0.35
-            and abs(np.dot(right[0] - head[0], fwd)) < 0.35
-        )
-        if not in_pose:
-            self.since = None
-            return False
-        pts = np.concatenate([left[0], right[0], head[0]])
-        if self.since is None or np.max(np.abs(pts - self.anchor)) > 0.05:
-            self.since, self.anchor = now, pts
-            return False
-        if now - self.since >= self.HOLD:
-            self.since = None
-            self.armed = False  # lower the arms before the next one
-            return True
-        return False
-
-
 class Calibrator:
     def __init__(self):
         self.shm = Shm()
         saved = load_json(CAL_FILE, {})
         self.eye = saved.get("eye_height")
-        self.cal = {s: {"role": c["role"], "off": pose_arr(c["off"])}
+        self.cal = {s: {"role": c["role"], "off": pose_arr(c["off"]), **({"mount": tuple(c["mount"])} if c.get("mount") else {})}
                     for s, c in saved.get("trackers", {}).items()}
-        self.settings = {"tpose": True, "dots": False, "stance_cm": 12, **load_json(SETTINGS_FILE, {})}
+        self.settings = {"tpose": False, "dots": False, "voice": True, "stance_cm": 12, **load_json(SETTINGS_FILE, {})}
         self.vr = None
+        self.monado = MonadoDevices()
+        self.monado_svc = False
+        self.last_monado_check = 0.0
+        self.monado_on = False  # attached to Monado (calibration bridge) instead of SteamVR
+        self.last_head = None
+        self.last_real = {}  # serial -> real body pose of each tracker, last tick
+        self.last_hands = (None, None)
+        self.why_not = ""  # why the last automatic calibration did not happen: "trackers" / "standing"
+        self.facing_in_head = (1.0, 0.0)  # her body's facing as (forward, right) parts of the head's heading, from the last calibration
+        self.note = ("", 0.0)  # message for her on the watch panel: (text, until monotonic time)
         self.overlay = None
         self.dots = {}
         self.dot_color = {}
-        self.tpose = TPoseDetector()
         self.override_until = 0.0
         self.override = None
         self.status = {}
@@ -161,13 +136,99 @@ class Calibrator:
         self.std_from_raw = None
         self.world_fix = {}  # serial -> what other drivers do to it after ours, see body_pose
         self.vrc_eye = None  # eye height VRChat uses (from its log), see follow_head
+        self.avatar = None  # VRChat avatar name we wear now (from its log), see set_avatar
         self.push_slots()
 
-    # ---- shared memory ----
+    def speak(self, name):
+        """Says a hint aloud (files made by voice/make_voice.sh); a new one cuts the previous."""
+        global _voice_proc
+        path = VOICE_DIR / f"{name}.ogg"
+        if not self.settings.get("voice", True) or not path.exists():
+            return
+        if _voice_proc and _voice_proc.poll() is None:
+            _voice_proc.terminate()
+        _voice_proc = subprocess.Popen(["paplay", str(path)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    def waist_mount(self):
+        """Where the waist tracker hangs, as measured at the last calibration: (angle°, distance m)."""
+        return next((c.get("mount") for c in self.cal.values() if c["role"] == "waist"), None)
+
+    # her side-of-belt tracker rolled +7.6° when she sat (2026-11-14); learned on, see learn_sitting()
+    SIT_ROLL_DEFAULT, SIT_PITCH_DEFAULT = 7.6, 25.0
+
+    def balanced(self, c):
+        """(roll_bias, sit_pitch) rad for the waist: the sitting roll taken off (Monado bridge only; the
+        SteamVR driver has no such mode). None for other trackers / switched off."""
+        if not (c["role"] == "waist" and self.settings.get("balanced_waist", True) and getattr(self, "monado_on", False)):
+            return None
+        return (np.radians(self.settings.get("sit_roll_bias_deg", self.SIT_ROLL_DEFAULT)),
+                np.radians(self.settings.get("sit_pitch_deg", self.SIT_PITCH_DEFAULT)))
+
+    def learn_sitting(self, head, trackers_real, now):
+        """Learns how much the side tracker rolls when she sits upright: the median over the last minute
+        of upright sitting (leans to both sides even out; slouching or lying is not counted)."""
+        c = next(((s, c) for s, c in self.cal.items() if c["role"] == "waist"), None)
+        if not c or c[0] not in trackers_real or not self.eye or head is None:
+            return
+        hist = self.__dict__.setdefault("sit_hist", [])
+        if hist and now - hist[-1][0] < 0.1:
+            return  # 10 samples a second are plenty
+        rigid = B.compose(trackers_real[c[0]], c[1]["off"])
+        m = B.pose_to_mat(np.zeros(3), rigid[1])[:, :3]
+        roll = float(np.degrees(np.arcsin(np.clip(m[:, 0][1], -1, 1))))
+        pitch = float(np.degrees(np.arcsin(np.clip(-m[:, 2][1], -1, 1))))
+        up = head[0] - rigid[0]
+        sitting = (0.55 * self.eye < head[0][1] < 0.85 * self.eye        # head at sitting height
+                   and up[1] > 0.45 and np.hypot(up[0], up[2]) < 0.25     # torso upright over the pelvis
+                   and 12 < pitch < 50 and abs(roll) < 20)                # pelvis tilted like sitting, not lying
+        if not sitting:
+            return
+        hist.append((now, roll, pitch))
+        self.__dict__["sit_last"] = (now, roll, pitch)
+        del hist[:max(0, len(hist) - 600)]
+        if len(hist) < 100 or now - self.__dict__.get("sit_pushed", 0.0) < 5.0:
+            return
+        st = self.settings
+        st["sit_roll_bias_deg"] = float(np.clip(np.median([h[1] for h in hist]), -12.0, 12.0))
+        st["sit_pitch_deg"] = float(np.clip(np.median([h[2] for h in hist]), 15.0, 45.0))
+        self.__dict__["sit_pushed"] = now
+        self.push_slots()
+        if now - self.__dict__.get("sit_saved", 0.0) > 30.0:
+            self.__dict__["sit_saved"] = now
+            save_json(SETTINGS_FILE, st)
+            log("sitting roll %.1f°, sitting pelvis tilt %.0f° (%d samples)" % (st["sit_roll_bias_deg"], st["sit_pitch_deg"], len(hist)))
+
+    def sit_straight(self):
+        """«Я сиджу рівно»: take how the tracker sits right now (last second and a half of upright
+        sitting) as the sitting roll at once, instead of waiting for the slow learning."""
+        now = time.monotonic()
+        recent = [(r, p) for t, r, p in self.__dict__.get("sit_hist", []) if now - t < 1.5]
+        if len(recent) < 8:
+            self.say("Сядь рівно і натисни ще раз", 8.0)
+            log("sit straight: she is not sitting upright now")
+            return
+        st = self.settings
+        st["sit_roll_bias_deg"] = float(np.clip(np.median([r for r, _ in recent]), -12.0, 12.0))
+        st["sit_pitch_deg"] = float(np.clip(np.median([p for _, p in recent]), 15.0, 45.0))
+        save_json(SETTINGS_FILE, st)
+        self.push_slots()
+        self.say(f"Запам'ятала, як ти сидиш: нахил {st['sit_roll_bias_deg']:+.0f}°", 8.0)
+        log("sit straight: sitting roll %.1f°, tilt %.0f°" % (st["sit_roll_bias_deg"], st["sit_pitch_deg"]))
+
+    def active(self):
+        """«Наша калібровка» switch: off = the trackers go to VRChat exactly as they are (to compare)."""
+        return bool(self.settings.get("enabled", True))
+
     def push_slots(self):
         slots = []
+        if not self.active():
+            self.shm.write_slots([])  # passthrough: no offsets, no freeze
+            return
         for serial, c in self.cal.items():
-            s = {"serial": serial, "mode": OFFSET, "off": c["off"]}
+            fix = self.balanced(c)
+            s = {"serial": serial, "mode": BALANCED if fix else OFFSET, "off": c["off"]}
+            if fix:  # the bridge reads the sitting roll and tilt from the override fields
+                s["ov"] = (np.array([fix[0], fix[1], 0.0]), np.array([1.0, 0, 0, 0]))
             if self.override and serial in self.override:
                 s["mode"] = OVERRIDE
                 s["ov"] = self.override[serial]
@@ -177,7 +238,8 @@ class Calibrator:
     def save(self):
         save_json(CAL_FILE, {
             "eye_height": self.eye,
-            "trackers": {s: {"role": c["role"], "off": pose_list(c["off"])} for s, c in self.cal.items()},
+            "trackers": {s: {"role": c["role"], "off": pose_list(c["off"]), **({"mount": list(c["mount"])} if c.get("mount") else {})}
+                         for s, c in self.cal.items()},
         })
 
     # ---- SteamVR ----
@@ -222,8 +284,68 @@ class Calibrator:
         self.world_fix = {}
         log("SteamVR closed")
 
+    @property
+    def connected(self):
+        return bool(self.vr) or self.monado_on
+
+    def monado_service_running(self):
+        now = time.monotonic()
+        if now - self.last_monado_check > 2:
+            self.last_monado_check = now
+            self.monado_svc = subprocess.run(["pgrep", "-x", "monado-service"],
+                                             stdout=subprocess.DEVNULL).returncode == 0
+        return self.monado_svc
+
+    def tick_monado(self):
+        """Same job as tick() on Monado, where the bridge in the runtime publishes the real poses.
+
+        Everything lives in one room space there (no Space Calibrator in between), so the
+        real pose IS the body pose and nothing has to be taken back off like under SteamVR.
+        """
+        alive = self.monado.alive()
+        if alive != self.monado_on:
+            self.monado_on = alive
+            self.std_from_raw = NO_FIX if alive else None
+            self.world_fix = {}
+            log("connected to Monado" if alive else "Monado closed")
+            self.push_slots()  # the waist gets its Monado-only balanced mode
+        if not alive:
+            return
+        head = left = right = None
+        trackers_real, final = {}, {}
+        for d in self.monado.read():
+            p = (d["pos"], d["rot"])
+            if d["kind"] == HMD:
+                head = p
+            elif d["kind"] == LEFT:
+                left = p
+            elif d["kind"] == RIGHT:
+                right = p
+            elif d["kind"] == TRACKER:
+                trackers_real[d["serial"]] = p
+                c = self.cal.get(d["serial"])
+                final[d["serial"]] = B.final_pose(p, c["off"], self.balanced(c)) if c else p
+        self.status = {"driver": True, "seen": set(trackers_real), "final": final}
+        self.last_real = trackers_real
+        self.last_hands = (left, right)
+        if head is None:
+            return
+        self.last_head = head
+        now = time.monotonic()
+        if not self.override and self.active():
+            self.learn_sitting(head, trackers_real, now)
+        if self.override and now > self.override_until:
+            self.end_override()
+        elif self.override:
+            self.follow_head(head)
+
     def tick(self):
         self.shm.heartbeat()
+        if self.vr is None and self.monado_service_running():
+            self.tick_monado()
+            return
+        if self.monado_on:
+            self.tick_monado()  # service is gone: logs "Monado closed"
         if not self.ensure_vr():
             return
         ev = openvr.VREvent_t()
@@ -262,14 +384,14 @@ class Calibrator:
                     if rp is not None:
                         trackers_real[serial] = self.body_pose(serial, final[serial], rp)
         self.status = {"driver": self.shm.driver_alive(), "seen": set(trackers_real), "final": final}
+        self.last_real = trackers_real
+        self.last_hands = (left, right)
 
         now = time.monotonic()
         if self.override and now > self.override_until:
             self.end_override()
         elif self.override:
             self.follow_head(head)
-        if self.settings["tpose"] and not self.override and self.tpose.update(head, left, right, now):
-            self.calibrate(head, trackers_real)
         self.update_dots(head, final)
 
     def body_pose(self, serial, final, raw):
@@ -288,37 +410,77 @@ class Calibrator:
         return pose
 
     # ---- actions ----
-    def calibrate(self, head, trackers_real):
-        cal, eye = B.calibrate(head, trackers_real)
+    def calibrate(self, head, trackers_real, hands=None):
+        """Measures her from where she stands right now (VRChat's calibration has started): height from the
+        head, which tracker is which, the levers, and the body's facing from the arms (her head is often a
+        few degrees off her body). The feet stay where she keeps them. False when she is not standing."""
+        facing = B.facing_from_hands(*hands) if hands and None not in hands else None
+        hf, hr = B.head_frame(head)
+        facing_head = (1.0, 0.0) if facing is None else (float(facing @ hf), float(facing @ hr))
+        cal, eye = B.calibrate(head, trackers_real, facing=facing, waist_mount="auto")
         if not cal:
-            log(f"T-pose seen but only {len(B.body_trackers(head, trackers_real))} body trackers are tracking")
-            play("dialog-warning.oga")
-            return
+            log(f"only {len(B.body_trackers(head, trackers_real))} body trackers are tracking")
+            self.why_not = "trackers"
+            return False
         roles = {s: c["role"] for s, c in cal.items()}
-        if not B.feet_together(trackers_real, roles):
-            log("T-pose seen but feet are not together — skipped")
-            play("dialog-warning.oga")
-            return
-        self.cal, self.eye = cal, eye
+        ok, why = B.standing_ok(head, trackers_real, roles)
+        if not ok:
+            log(f"automatic calibration skipped: {why}")
+            self.why_not = "standing"
+            return False
+        self.cal, self.eye, self.facing_in_head = cal, eye, facing_head
         self.save()
         self.push_slots()
-        play("camera-shutter.oga")
-        log("calibrated: eye %.3f m, %s" % (eye, roles))
+        cm = eye / VRC_EYE_RATIO * 100
+        mount = self.waist_mount()
+        log("calibrated automatically: eye %.3f m (height ≈ %.0f cm), waist tracker %s %.0f°, %s"
+            % (eye, cm, B.place_name(mount[0]), mount[0], roles))
+        self.say(f"Калібрування у VRChat: автоматично. Зріст ≈ {cm:.0f} см", 15.0)
+        return True
 
     def start_override(self, reason):
+        """VRChat started its calibration: measure her from where she stands right now (height from the
+        head, roles, levers, facing from the arms), then freeze the trackers on the ideal T-pose for it.
+        Nothing has to be pressed or calibrated before. Not standing (sitting, lying): the last
+        calibration is used and the ideal body hangs from the head."""
         if self.override and reason.startswith("VRChat"):
             return  # both VRChat start lines arrive for one calibration
-        if not self.cal or self.eye is None or not self.vr or self.std_from_raw is None:
-            log("VRChat calibration requested but not calibrated / no SteamVR")
+        if not self.active():
+            log(f"VRChat calibration ({reason}): our calibration is switched off, trackers pass through")
+            return
+        if not self.connected or self.std_from_raw is None:
+            log("VRChat calibration requested but no SteamVR or Monado")
             play("dialog-warning.oga")
             return
-        poses = self.vr.getDeviceToAbsoluteTrackingPose(openvr.TrackingUniverseStanding, 0, 1)
-        head = B.mat_to_pose(poses[0].mDeviceToAbsoluteTracking.m)
+        if self.monado_on:
+            head = self.last_head
+            if head is None:
+                return
+        else:
+            poses = self.vr.getDeviceToAbsoluteTrackingPose(openvr.TrackingUniverseStanding, 0, 1)
+            head = B.mat_to_pose(poses[0].mDeviceToAbsoluteTracking.m)
         self.settings.update(load_json(SETTINGS_FILE, {}))  # may be edited outside the window
+        self.why_not = "trackers"
+        measured = self.calibrate(head, dict(self.last_real), self.last_hands) if self.last_real else False
+        if not measured and self.why_not == "trackers":
+            # a tracker is off or lost: say which one (VRChat would get a body without it)
+            missing = [role_name(c["role"]) for s, c in self.cal.items() if s not in self.last_real]
+            self.say("Не бачу: " + ", ".join(missing) if missing else "Не бачу всі три трекери", 20.0)
+            log(f"VRChat calibration: trackers missing {missing or '(not three seen)'}")
+            play("dialog-warning.oga")
+            self.speak("few_trackers")
+            if not self.cal or missing:
+                return
+        elif not measured and (not self.cal or self.eye is None):
+            self.say("Стань рівно і відкалібруйся у VRChat ще раз", 15.0)
+            log("VRChat calibration requested but she is not standing and nothing is saved")
+            play("dialog-warning.oga")
+            self.speak("need_stand")
+            return
         self.override_until = time.monotonic() + OVERRIDE_SECONDS
         self.follow_head(head)
         play("bell.oga")
-        log(f"trackers frozen on ideal T-pose ({reason})")
+        log(f"trackers frozen on ideal T-pose ({reason}{', measured now' if measured else ', last calibration'})")
 
     def follow_head(self, head):
         """Put the frozen trackers on the ideal T-pose under the current head.
@@ -330,13 +492,35 @@ class Calibrator:
         # VRChat hangs an avatar sized for ITS eye height from the head. Building the T-pose
         # from that height puts the trackers on the avatar's hips and feet, so they snap on
         # even when VRChat's "Real height" differs from her real one (173 vs ~161 cm, 2026-10-24).
-        eye = self.vrc_eye or self.eye
-        model = B.model_points(head, eye, head_y=B.level_eye_y(head), ankle_side=side)
+        # her real eye height (measured at calibration) — the same the calibration used — so the trackers
+        # do not jump when VRChat lets go; VRChat's own height setting is only reported (height_hint)
+        eye = (self.vrc_eye if self.settings.get("match_vrchat_height") else None) or self.eye
+        # the body faces where it did at calibration relative to the head (her head is usually a few degrees off her body)
+        hf, hr = B.head_frame(head)
+        facing = self.facing_in_head[0] * hf + self.facing_in_head[1] * hr
+        facing = facing / np.linalg.norm(facing)
+        model = B.model_points(head, eye, head_y=B.level_eye_y(head), ankle_side=side, facing=facing)
+        self.keep_waist_where_it_is(model)
         raw_from_std = B.inverse(self.std_from_raw)
         self.override = {s: B.compose(raw_from_std, B.compose(B.inverse(self.world_fix.get(s, NO_FIX)),
                                                               model[c["role"]]))
                          for s, c in self.cal.items()}
         self.push_slots()
+
+    def keep_waist_where_it_is(self, model):
+        """While she stands, freeze the waist where her pelvis really is (front-back and sideways)
+        instead of hanging it from the head: a model guess a few cm off made the hips jump when
+        VRChat let go (2026-11-13: +3 cm forward, measured). Lying or bent over, the model is kept."""
+        for serial, c in self.cal.items():
+            if c["role"] != "waist" or serial not in self.last_real:
+                continue
+            follow = B.final_pose(self.last_real[serial], c["off"], self.balanced(c))
+            want = model["waist"]
+            d = follow[0] - want[0]
+            if np.hypot(d[0], d[2]) < 0.15 and abs(d[1]) < 0.20:
+                # the waist sits where the calibration put it next to the tracker (its height included)
+                y = follow[0][1] if c.get("mount") else want[0][1]
+                model["waist"] = (np.array([follow[0][0], y, follow[0][2]]), want[1])
 
     def set_vrc_eye(self, eye):
         if eye == self.vrc_eye:
@@ -346,6 +530,29 @@ class Calibrator:
         if self.eye:
             msg += ", measured %.3f m → real height ≈ %.0f cm" % (self.eye, self.eye / VRC_EYE_RATIO * 100)
         log(msg)
+
+    def set_avatar(self, name):
+        """Each avatar keeps its own feet distance: avatars differ, so one value never fit all.
+
+        An avatar seen for the first time starts with the distance in use now.
+        """
+        if name == self.avatar:
+            return
+        self.avatar = name
+        self.settings.update(load_json(SETTINGS_FILE, {}))  # may be edited outside the window
+        per = self.settings.setdefault("avatar_stance", {})
+        if name in per:
+            self.settings["stance_cm"] = per[name]
+        else:
+            per[name] = self.settings["stance_cm"]
+        save_json(SETTINGS_FILE, self.settings)
+        log(f"VRChat avatar «{name}»: {self.settings['stance_cm']} cm between feet")
+
+    def set_stance(self, cm):
+        self.settings["stance_cm"] = cm
+        if self.avatar:
+            self.settings.setdefault("avatar_stance", {})[self.avatar] = cm
+        save_json(SETTINGS_FILE, self.settings)
 
     def height_hint(self):
         """Advice when VRChat's "Real height" is far from the height measured in the T-pose."""
@@ -361,11 +568,14 @@ class Calibrator:
             play("complete.oga")
             log("trackers follow the body again")
 
-    def reset(self):
-        self.cal, self.eye = {}, None
-        self.save()
-        self.shm.write_slots([])
-        log("calibration cleared")
+    # ---- waist pivot ----
+    WAIST_SECONDS = 12.0
+    WAIST_LEAD = 4.0  # time to lower the arms after the T-pose
+
+    def say(self, text, secs=12.0):
+        """A short message on the watch panel."""
+        self.note = (text, time.monotonic() + secs)
+        log(f"note: {text}")
 
     def write_status(self):
         """Snapshot for the watch panel in VRN; a stale timestamp tells it we are not running."""
@@ -374,14 +584,19 @@ class Calibrator:
                     for serial, i in sorted(self.cal.items(), key=lambda kv: kv[1]["role"])]
         data = {
             "ts": time.time(),
-            "vr": bool(self.vr),
+            "vr": self.connected,
             "driver": bool(self.status.get("driver")),
             "calibrated": bool(self.cal),
             "trackers": trackers,
+            "note": self.note[0] if time.monotonic() < self.note[1] else None,
             "override_left": max(0, int(self.override_until - time.monotonic())) if self.override else None,
-            "tpose": bool(self.settings["tpose"]),
+            "tpose": False,  # the T-pose step is gone (the watch panel still reads the field)
             "dots": bool(self.settings["dots"]),
+            "voice": bool(self.settings.get("voice", True)),
+            "enabled": self.active(),
+            "waist_place": B.place_name(self.waist_mount()[0]) if self.waist_mount() else None,
             "stance_cm": int(self.settings["stance_cm"]),
+            "avatar": self.avatar,
             "height_hint": self.height_hint(),
         }
         CACHE.mkdir(parents=True, exist_ok=True)
@@ -422,109 +637,182 @@ class Calibrator:
             self.overlay.showOverlay(h)
 
 
+class Updates:
+    """GitHub releases: the list of versions for the window, a check every 6 hours, and — when she
+    switched «Оновлювати автоматично» on — installing a newer one while VR is off (never mid-game)."""
+
+    CHECK_EVERY = 6 * 3600
+
+    def __init__(self, cal):
+        self.cal = cal
+        self.rels = None          # [{tag, version, date, notes}] once fetched
+        self.error = None
+        self.next_check = 0.0
+        self.busy = False         # a check or an install is running in the background
+        self.installed = None     # tag just installed: restart into it
+        self.told = None          # the newer version she was told about
+
+    def _run(self, fn):
+        self.busy = True
+
+        def work():
+            try:
+                fn()
+            except Exception as e:  # network or GitHub down: try again later
+                self.error = str(e)
+                log(f"update: {e}")
+            finally:
+                self.busy = False
+        threading.Thread(target=work, daemon=True).start()
+
+    def check(self):
+        self.next_check = time.monotonic() + self.CHECK_EVERY
+        self.error = None
+
+        def fetch():
+            self.rels = update.releases()
+        self._run(fetch)
+
+    def install(self, tag):
+        def go():
+            log(f"update: installing {tag}")
+            update.install(tag)
+            self.installed = tag
+        self._run(go)
+
+    def poll(self):
+        """Called from the window's slow timer (Qt thread)."""
+        if self.installed:
+            log(f"updated to {self.installed}, restarting")
+            subprocess.Popen(["bash", "-c", "sleep 2; exec \"$0\"", str(Path.home() / ".local/bin/fbt-calibrator")],
+                             start_new_session=True)
+            QApplication.quit()
+            return
+        if self.busy:
+            return
+        if time.monotonic() >= self.next_check:
+            self.check()
+            return
+        new = update.newest_if_newer(self.rels or [])
+        if not new:
+            return
+        if self.cal.settings.get("auto_update", False):
+            if not self.cal.connected:  # VR is off
+                self.install(new["tag"])
+            elif self.told != new["tag"]:
+                self.told = new["tag"]
+                self.cal.say(f"Є нова версія {new['version']} — оновиться, коли вимкнеш VR", 30.0)
+        elif self.told != new["tag"]:
+            self.told = new["tag"]
+            self.cal.say(f"Є нова версія {new['version']} — встанови у вікні програми", 30.0)
+            log(f"update: {new['version']} is available")
+
+
 class Window(QWidget):
+    """Only two switches: everything else happens by itself when she calibrates in VRChat."""
+
     def __init__(self, cal):
         super().__init__()
         self.cal = cal
         self.setWindowTitle(tr("title"))
         lay = QVBoxLayout(self)
-        self.info = QLabel()
-        self.info.setWordWrap(True)
-        lay.addWidget(self.info)
-
-        btn = QPushButton(tr("btn_override"))
-        btn.clicked.connect(lambda: cal.start_override("button"))
-        lay.addWidget(btn)
-
-        self.tpose = QCheckBox(tr("chk_tpose"))
-        self.tpose.setChecked(cal.settings["tpose"])
-        self.tpose.toggled.connect(lambda v: self.set("tpose", v))
-        lay.addWidget(self.tpose)
+        self.enabled = QCheckBox(tr("chk_enabled"))
+        self.enabled.setChecked(cal.active())
+        self.enabled.toggled.connect(lambda v: self.set("enabled", v))
+        lay.addWidget(self.enabled)
 
         self.dots = QCheckBox(tr("chk_dots"))
         self.dots.setChecked(cal.settings["dots"])
         self.dots.toggled.connect(lambda v: self.set("dots", v))
         lay.addWidget(self.dots)
 
+        sit = QPushButton(tr("sit_straight"))
+        sit.setToolTip(tr("sit_tip"))
+        sit.clicked.connect(cal.sit_straight)
+        lay.addWidget(sit)
+
+        self.info = QLabel()
+        self.info.setWordWrap(True)
+        lay.addWidget(self.info)
+
+        # updates: pick any published version (newer or older), or let it update by itself
+        self.updates = Updates(cal)
         row = QHBoxLayout()
-        narrower = QPushButton(tr("narrower"))
-        narrower.clicked.connect(lambda: self.stance(-2))
-        wider = QPushButton(tr("wider"))
-        wider.clicked.connect(lambda: self.stance(+2))
-        self.stance_label = QLabel()
-        row.addWidget(narrower)
-        row.addWidget(self.stance_label)
-        row.addWidget(wider)
+        row.addWidget(QLabel(tr("version_now", v=VERSION)))
+        self.versions = QComboBox()
+        self.versions.addItem(tr("checking"))
+        row.addWidget(self.versions, 1)
+        install = QPushButton(tr("install_version"))
+        install.clicked.connect(self.install_chosen)
+        row.addWidget(install)
         lay.addLayout(row)
-        self.stance(0)
-
-        reset = QPushButton(tr("reset"))
-        reset.clicked.connect(cal.reset)
-        lay.addWidget(reset)
-
-        upd = QPushButton(tr("update"))
-        upd.clicked.connect(self.check_update)
-        lay.addWidget(upd)
+        self.auto_update = QCheckBox(tr("auto_update"))
+        self.auto_update.setChecked(bool(cal.settings.get("auto_update", False)))
+        self.auto_update.toggled.connect(lambda v: self.set("auto_update", v))
+        lay.addWidget(self.auto_update)
+        self.shown_rels = None
 
         about = QLabel(tr("about", v=VERSION, repo=REPO))
         about.setOpenExternalLinks(True)
         about.setStyleSheet("color: gray; font-size: small")
         lay.addWidget(about)
-        self.resize(400, 300)
-
-    def check_update(self):
-        try:
-            info = update.check()
-            if not info:
-                QMessageBox.information(self, tr("title"), tr("update_none", v=VERSION))
-                return
-            if QMessageBox.question(self, tr("title"), tr("update_ask", v=info["version"])) != QMessageBox.Yes:
-                return
-            update.install(info)
-        except Exception as e:  # network, GitHub or installer failure: tell the user, keep running
-            QMessageBox.warning(self, tr("title"), tr("update_fail", e=e))
-            return
-        QMessageBox.information(self, tr("title"), tr("update_done", v=info["version"]))
-        log(f"updated to {info['version']}, restarting")
-        subprocess.Popen(["bash", "-c", "sleep 2; exec \"$0\"", str(Path.home() / ".local/bin/fbt-calibrator")],
-                         start_new_session=True)
-        QApplication.quit()
-
-    def stance(self, delta):
-        """Feet distance used for VRChat calibration (applies on the next one)."""
-        cm = max(0, min(40, self.cal.settings["stance_cm"] + delta))
-        self.set("stance_cm", cm)
-        self.stance_label.setText(tr("stance", cm=cm))
+        self.resize(380, 200)
 
     def set(self, key, value):
         self.cal.settings[key] = value
         save_json(SETTINGS_FILE, self.cal.settings)
+        if key == "enabled":
+            if not value and self.cal.override:
+                self.cal.override = None
+            self.cal.push_slots()
+            log("our calibration " + ("ON" if value else "OFF (trackers pass through)"))
+
+    def install_chosen(self):
+        rel = self.versions.currentData()
+        if not rel:
+            return
+        if rel["version"] == VERSION:
+            QMessageBox.information(self, tr("title"), tr("same_version"))
+            return
+        if QMessageBox.question(self, tr("title"), tr("install_ask", v=rel["version"])) != QMessageBox.Yes:
+            return
+        self.updates.install(rel["tag"])
+
+    def show_versions(self):
+        rels = self.updates.rels
+        if rels is self.shown_rels:
+            return
+        self.shown_rels = rels
+        self.versions.clear()
+        if not rels:
+            self.versions.addItem(tr("no_versions") if self.updates.error else tr("checking"))
+            return
+        for rel in rels:
+            mark = tr("installed") if rel["version"] == VERSION else (tr("new") if update.newer(rel["version"], VERSION) else "")
+            self.versions.addItem(f"{rel['version']}  ({rel['date']}){mark}", rel)
 
     def refresh(self):
+        self.updates.poll()
+        self.show_versions()
         c = self.cal
-        lines = []
-        if not c.vr:
+        lines = [tr("how")]
+        if not c.connected:
             lines.append(tr("wait_vr"))
         elif not c.status.get("driver"):
             lines.append(tr("no_driver"))
-        if not c.cal:
-            lines.append(tr("not_calibrated"))
-        else:
-            seen = c.status.get("seen", set())
-            for serial, info in sorted(c.cal.items(), key=lambda kv: kv[1]["role"]):
-                ok = "✅" if serial in seen else "❌"
-                lines.append(f"{ok} {role_name(info['role'])}")
-        hint = c.height_hint()
-        if hint:
-            lines.append(hint)
+        seen = c.status.get("seen", set())
+        for serial, info in sorted(c.cal.items(), key=lambda kv: kv[1]["role"]):
+            lines.append(f"{'✅' if serial in seen else '❌'} {role_name(info['role'])}")
+        mount = c.waist_mount()
+        if mount:
+            lines.append(tr("waist_place", place=B.place_name(mount[0])))
         if c.override:
-            left = max(0, int(c.override_until - time.monotonic()))
-            lines.append(tr("frozen", s=left))
+            lines.append(tr("frozen", s=max(0, int(c.override_until - time.monotonic()))))
         self.info.setText("\n".join(lines))
 
 
 def handle_watch_commands(cal, win):
-    """Button presses from the VRN watch panel: one file per command in COMMANDS."""
+    """Button presses from the watch panel in VR: one file per command in COMMANDS."""
     if not COMMANDS.is_dir():
         return
     for path in sorted(COMMANDS.iterdir()):
@@ -534,16 +822,12 @@ def handle_watch_commands(cal, win):
         except OSError:
             continue
         log(f"watch command: {' '.join(cmd)}")
-        if cmd[:1] == ["override"]:
-            cal.start_override("watch")
-        elif cmd[:1] == ["reset"]:
-            cal.reset()
-        elif cmd[:2] == ["toggle", "tpose"]:
-            win.tpose.setChecked(not win.tpose.isChecked())
+        if cmd[:2] == ["toggle", "enabled"]:
+            win.enabled.setChecked(not win.enabled.isChecked())
+        elif cmd[:2] == ["sit", "straight"]:
+            cal.sit_straight()
         elif cmd[:2] == ["toggle", "dots"]:
             win.dots.setChecked(not win.dots.isChecked())
-        elif cmd[:1] == ["stance"] and len(cmd) == 2 and cmd[1].lstrip("+-").isdigit():
-            win.stance(int(cmd[1]))
         elif cmd[:1] == ["show"]:
             bring_up(win)
 
@@ -597,7 +881,8 @@ def main():
     win = Window(cal)
 
     watcher = VrchatLogWatcher(on_start=lambda: cal.start_override("VRChat calibration"),
-                               on_end=cal.end_override, log=log, on_height=cal.set_vrc_eye)
+                               on_end=cal.end_override, log=log, on_height=cal.set_vrc_eye,
+                               on_avatar=cal.set_avatar)
 
     pix = QPixmap(dot_image("#3d8bfd"))
     tray = QSystemTrayIcon(QIcon(pix))
@@ -606,9 +891,6 @@ def main():
     show = QAction(tr("tray_open"), menu)
     show.triggered.connect(lambda: bring_up(win))
     menu.addAction(show)
-    vrc = QAction(tr("btn_override"), menu)
-    vrc.triggered.connect(lambda: cal.start_override("tray"))
-    menu.addAction(vrc)
     quit_ = QAction(tr("tray_quit"), menu)
     quit_.triggered.connect(app.quit)
     menu.addAction(quit_)

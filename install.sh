@@ -15,8 +15,9 @@ command -v python3 >/dev/null || { echo "python3 is required / потрібен 
 
 say "Copying files / Копіюю файли → $APP"
 mkdir -p "$APP"
-rm -rf "$APP/app" "$APP/driver"
+rm -rf "$APP/app" "$APP/driver" "$APP/voice"
 cp -r "$SRC/app" "$SRC/driver" "$APP/"
+[ -d "$SRC/voice" ] && cp -r "$SRC/voice" "$APP/"
 cp "$SRC/LICENSE" "$SRC/NOTICE" "$SRC/uninstall.sh" "$SRC/fbt-calibrator" "$APP/"
 rm -rf "$APP/app/tests" "$APP/driver/build"
 find "$APP" -name __pycache__ -prune -exec rm -rf {} +

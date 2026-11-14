@@ -15,6 +15,8 @@ def calibrator():
     c.cal, c.eye, c.override, c.vrc_eye = {}, None, None, None
     c.world_fix = {}
     c.settings = {"stance_cm": 12}
+    c.last_real = {}
+    c.facing_in_head = (1.0, 0.0)
     return c
 
 
@@ -56,7 +58,7 @@ def test_calibrate_and_override_through_a_later_driver():
     cal, eye = b.calibrate(head, seen)
     assert {s: x["role"] for s, x in cal.items()} == {"W": "waist", "L": "left_foot", "R": "right_foot"}
     c.cal, c.eye = cal, eye
-    model = b.model_points(head, eye)
+    model = b.model_points(head, eye, ankle_side=float(np.hypot(*(seen["R"][0] - seen["L"][0])[[0, 2]]) / 2))
     for s, x in cal.items():
         assert np.allclose(final(c, s)[0], model[x["role"]][0], atol=1e-9)
         c.body_pose(s, final(c, s), raw[s])  # next tick, with the offset applied
@@ -72,6 +74,15 @@ def test_headset_mounted_tracker_is_not_a_body_tracker():
     head = (np.array([0, 1.6, 0]), np.array([1.0, 0, 0, 0]))
     q = np.array([1.0, 0, 0, 0])
     trackers = {"on-head": (np.array([0, 1.7, 0.1]), q), "W": (np.array([0, 0.95, 0]), q),
+                "L": (np.array([-0.07, 0.08, 0]), q), "R": (np.array([0.07, 0.08, 0]), q)}
+    cal, _ = b.calibrate(head, trackers)
+    assert set(cal) == {"W", "L", "R"} and cal["W"]["role"] == "waist"
+
+
+def test_tracker_hidden_far_away_is_not_a_body_tracker():
+    head = (np.array([0, 1.6, 0]), np.array([1.0, 0, 0, 0]))
+    q = np.array([1.0, 0, 0, 0])
+    trackers = {"hidden": (np.array([0, 9001.0, 0]), q), "W": (np.array([0, 0.95, 0]), q),
                 "L": (np.array([-0.07, 0.08, 0]), q), "R": (np.array([0.07, 0.08, 0]), q)}
     cal, _ = b.calibrate(head, trackers)
     assert set(cal) == {"W", "L", "R"} and cal["W"]["role"] == "waist"

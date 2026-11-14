@@ -31,7 +31,6 @@ def find_log_dir():
         if d.is_dir():
             return d
     return None
-INTERESTING = re.compile(r"calibrat|\[IK|IKDebug|FBT|FBIK", re.I)
 # Seen 2026-10-20 (VRChat 2026.3.3, IK Debug Logging on). Pressing "Calibrate FBT" logs
 #   [VRCTrackingManager] [IK Debug Log] Calibrate FBT and reload avatar...
 #   [VRCTrackingManager] [IK Debug Log] Preparing for calibration...
@@ -43,13 +42,23 @@ END = re.compile(r"\[IK Debug Log\] Restore tracking\.\.\.")
 # "Changed player height... tracking scale:0.6480417 eye height:1.624643" (2026-10-24): the eye
 # height VRChat hangs the avatar from, taken from its "Real height" setting (1.73 m → 1.6246).
 HEIGHT = re.compile(r"Changed player height\.\.\. tracking scale:\s*[\d.]+ eye height:\s*([\d.]+)")
+# Who we are and which avatar we wear (2026-11-02). VRChat logs every player's avatar change, and
+# its own login lines come both before and after our first switch, so switches are kept by name.
+#   [Authentication - …] Preforming post login checks for Lokinya (usr_…)
+#   [Behaviour] Initialized PlayerAPI "Lokinya" is local
+#   [Behaviour] Switching Lokinya to avatar Kittysan Void Hoppou
+ME = re.compile(r'post login checks for (.+?) \(usr_|Initialized PlayerAPI "(.+)" is local')
+SWITCH = re.compile(r"\[Behaviour\] Switching (.+?) to avatar (.+)$")
 
 
 class VrchatLogWatcher:
-    def __init__(self, on_start, on_end, log, on_height=None):
+    def __init__(self, on_start, on_end, log, on_height=None, on_avatar=None):
         self.on_start = on_start
         self.on_end = on_end
         self.on_height = on_height or (lambda eye: None)
+        self.on_avatar = on_avatar or (lambda name: None)
+        self.me = None
+        self.avatars = {}  # player name -> last avatar seen in this log
         self.log = log
         self.log_dir = None
         self.path = None
@@ -68,6 +77,7 @@ class VrchatLogWatcher:
             self.path = newest
             self.pos = newest.stat().st_size  # only new lines
             self.last_height()
+            self.catch_up()
         try:
             with open(self.path, "rb") as f:
                 f.seek(self.pos)
@@ -79,14 +89,17 @@ class VrchatLogWatcher:
         cut = data.rfind(b"\n") + 1
         self.pos += cut
         for line in data[:cut].decode("utf-8", "replace").splitlines():
-            if INTERESTING.search(line) and "Selfie Expression" not in line:
-                self.log("vrchat: " + line.strip()[:300])
+            self.who(line)
             m = HEIGHT.search(line)
             if m:
                 self.on_height(float(m.group(1)))
+            # Only the lines we act on: with IK Debug Logging VRChat writes many IK lines
+            # a second, which grew our log to 1.8 GB (2026-10-28).
             if START.search(line):
+                self.log("vrchat: " + line.strip()[:300])
                 self.on_start()
             elif END.search(line):
+                self.log("vrchat: " + line.strip()[:300])
                 self.on_end()
 
     def last_height(self):
@@ -100,3 +113,32 @@ class VrchatLogWatcher:
         found = HEIGHT.findall(tail)
         if found:
             self.on_height(float(found[-1]))
+
+    def who(self, line, report=True):
+        """Track our own name and avatar; report our avatar when it changes."""
+        m = SWITCH.search(line)
+        if m:
+            self.avatars[m.group(1)] = m.group(2).strip()
+            if m.group(1) != self.me:
+                return
+        else:
+            m = ME.search(line)
+            if not m:
+                return
+            self.me = m.group(1) or m.group(2)
+        if report and self.me in self.avatars:
+            self.on_avatar(self.avatars[self.me])
+
+    def catch_up(self):
+        """Avatar already on when we start (or after VRChat restarts): scan the log written so far."""
+        self.me, self.avatars = None, {}
+        try:
+            with open(self.path, "rb") as f:
+                text = f.read(self.pos).decode("utf-8", "replace")
+        except OSError:
+            return
+        for line in text.splitlines():
+            if "Switching " in line or "post login" in line or "PlayerAPI" in line:
+                self.who(line, report=False)  # only the avatar worn now, not the history
+        if self.me in self.avatars:
+            self.on_avatar(self.avatars[self.me])

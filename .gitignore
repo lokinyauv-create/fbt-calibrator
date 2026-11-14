@@ -2,3 +2,5 @@
 __pycache__/
 driver/build/
 *.pyc
+sim/recordings/
+tutorial/*.mp4

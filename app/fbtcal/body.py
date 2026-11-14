@@ -23,6 +23,9 @@ ROLES = ("waist", "left_foot", "right_foot")
 # for a Quest + Lighthouse mix, 2026-10-28) — it is not a body tracker. The waist sits
 # ~0.6 m below the eyes in a T-pose, so this cannot catch a real one.
 HEAD_MOUNT_RADIUS = 0.30
+# Farther than this from the eyes is not on the body either. Space Calibrator's "Hide
+# target device" parks the headset tracker 9 km up, which got taken as the waist (2026-10-28).
+BODY_REACH = 2.5
 
 
 def q_mul(a, b):
@@ -110,6 +113,25 @@ def head_frame(head):
     return fwd, right
 
 
+def facing_frame(fwd):
+    """forward/right unit vectors from a horizontal facing direction."""
+    f = np.array([fwd[0], 0.0, fwd[2]])
+    f /= np.linalg.norm(f)
+    return f, np.cross(f, UP)
+
+
+def facing_from_hands(left, right):
+    """Where the chest faces in a T-pose: square to the line between the hands (arms out to the
+    sides). The head may look a little aside; over a 1.5 m arm span the hands are far steadier.
+    None when the hands are not clearly apart."""
+    d = np.asarray(right[0], float) - np.asarray(left[0], float)
+    d[1] = 0.0
+    n = np.linalg.norm(d)
+    if n < 0.8:
+        return None
+    return np.cross(UP, d / n)
+
+
 def neck(head):
     """Neck pivot: the point the head turns around (head-local +Z is backwards)."""
     return head[0] + q_rot(head[1], [0.0, -NECK_UP, NECK_FWD])
@@ -120,15 +142,16 @@ def level_eye_y(head):
     return float(neck(head)[1] + NECK_UP)
 
 
-def model_points(head, eye_height, head_y=None, ankle_side=ANKLE_SIDE):
+def model_points(head, eye_height, head_y=None, ankle_side=ANKLE_SIDE, facing=None):
     """Ideal joint poses for a straight T-pose with feet together ("pencil pose").
 
     `eye_height` is the standing eye height from calibration. When `head_y` is given
     (any-pose VRChat calibration, pass `level_eye_y(head)`), heights are placed relative
     to the current head instead of the floor, the way VRChat hangs the T-posed avatar from the head.
     `ankle_side` sets how far apart the feet are placed (Standable's "stance").
+    `facing` = where her body faces (horizontal); by default the head's heading.
     """
-    fwd, right = head_frame(head)
+    fwd, right = head_frame(head) if facing is None else facing_frame(facing)
     rot = q_yaw(fwd)
     base = neck(head)
     base[1] = 0.0
@@ -139,17 +162,18 @@ def model_points(head, eye_height, head_y=None, ankle_side=ANKLE_SIDE):
         p[1] = height * eye_height + lift
         return p, rot.copy()
 
+    waist = at(0.0, WAIST_HEIGHT)
     return {
-        "waist": at(0.0, WAIST_HEIGHT),
+        "waist": waist,
         "left_foot": at(-ankle_side, ANKLE_HEIGHT),
         "right_foot": at(ankle_side, ANKLE_HEIGHT),
     }
 
 
 def body_trackers(head, trackers):
-    """Drop trackers mounted on the headset."""
+    """Drop trackers mounted on the headset or parked far away."""
     return {s: p for s, p in trackers.items()
-            if np.linalg.norm(p[0] - head[0]) > HEAD_MOUNT_RADIUS}
+            if HEAD_MOUNT_RADIUS < np.linalg.norm(p[0] - head[0]) < BODY_REACH}
 
 
 def assign_roles(head, trackers):
@@ -172,15 +196,162 @@ def feet_together(trackers, roles, max_gap=0.30, max_dy=0.05):
     return np.hypot(d[0], d[2]) < max_gap and abs(d[1]) < max_dy
 
 
-def calibrate(head, trackers):
+def calibrate(head, trackers, facing=None, ankle_side=None, waist_mount=None):
     """Returns {serial: {"role", "off": (pos, rot)}} and the eye height, or None."""
     trackers = body_trackers(head, trackers)
     roles = assign_roles(head, trackers)
     if roles is None:
         return None, None
     eye = level_eye_y(head)
-    model = model_points(head, eye)
+    if ankle_side is None:
+        # the feet are where she keeps them: the calibration straightens the trackers but does not push
+        # the feet apart or together (that made the avatar's feet stay 20 cm apart when hers were together)
+        lf = next(s for s, r in roles.items() if r == "left_foot")
+        rf = next(s for s, r in roles.items() if r == "right_foot")
+        gap = trackers[rf][0] - trackers[lf][0]
+        ankle_side = float(np.clip(np.hypot(gap[0], gap[2]) / 2, 0.03, 0.20))
+    model = model_points(head, eye, ankle_side=ankle_side, facing=facing)
+    waist = next(s for s, r in roles.items() if r == "waist")
+    fwd, right = head_frame(head) if facing is None else facing_frame(facing)
+    if waist_mount == "auto":
+        waist_mount = detect_mount(head, trackers[waist][0], fwd, right, eye)
+    if waist_mount:
+        # the waist is the body centre next to the tracker; at the tracker's own height when it hangs at
+        # belt height, at the usual hip height when it hangs much higher or lower (chest, thigh)
+        centre = mount_centre(trackers[waist][0], waist_mount, fwd, right)
+        if abs(centre[1] - model["waist"][0][1]) > 0.12:
+            centre[1] = model["waist"][0][1]
+        model["waist"] = (centre, model["waist"][1])
     result = {}
     for serial, role in roles.items():
         result[serial] = {"role": role, "off": compose(inverse(trackers[serial]), model[role])}
+    if waist_mount:
+        result[waist]["mount"] = (float(waist_mount[0]), float(waist_mount[1]))
     return result, eye
+
+
+def standing_ok(head, trackers, roles):
+    """Is she standing, so the ideal body can be measured from where she is right now?
+    Returns (ok, why not). Used when VRChat starts its calibration: no T-pose step is asked for,
+    the calibration is taken at that moment — but only if the poses look like a person standing."""
+    eye = level_eye_y(head)
+    if not 1.15 < eye < 2.05:
+        return False, f"head at {eye:.2f} m, not standing"
+    n = neck(head)
+    for serial, role in roles.items():
+        p = np.asarray(trackers[serial][0], float)
+        if np.hypot(p[0] - n[0], p[2] - n[2]) > 0.40:
+            return False, f"{role} is {np.hypot(p[0] - n[0], p[2] - n[2]):.2f} m aside of the body axis"
+        if role == "waist" and not 0.40 * eye < p[1] < 0.80 * eye:
+            return False, f"waist tracker at {p[1]:.2f} m"
+        if role != "waist" and p[1] > 0.30:
+            return False, f"{role} tracker at {p[1]:.2f} m, foot not on the floor"
+    return True, ""
+
+
+def level_roll(pivot, final):
+    """The final pose without its sideways roll, turned about `pivot` (the tracker itself).
+
+    For a waist tracker worn on the side of the belt: it tilts sideways with flesh and clothes when
+    she sits (≈8°, 2026-11-14), and the long lever to the body centre made the whole body slide
+    sideways. Forward/back tilt and turning are kept. Mirror of level_roll() in the Monado bridge
+    (fbtcal.hpp) — keep both the same.
+    """
+    pos, q = final
+    fwd = q_rot(q, [0.0, 0.0, -1.0])
+    right = np.cross(fwd, UP)
+    n = np.linalg.norm(right)
+    if n < 1e-3:
+        return final
+    right = right / n
+    back = -fwd
+    up = np.cross(back, right)
+    level = mat_to_pose(np.column_stack([right, up, back, np.zeros(3)]))[1]
+    corr = q_mul(level, q_conj(q))
+    return np.asarray(pivot) + q_rot(corr, np.asarray(pos) - np.asarray(pivot)), level
+
+
+def final_pose(real, off, sitfix=None):
+    """The pose apps get for a tracker: real * offset; for the waist on Monado the sitting roll is
+    taken off (`sitfix` = (roll_bias, sit_pitch) in rad, see sit_fix)."""
+    f = compose(real, off)
+    return sit_fix(real[0], f, *sitfix) if sitfix else f
+
+
+# Where the waist tracker can hang, seen from above: angle from straight in front, clockwise (to her right).
+MOUNTS = {"front": 0, "front_right": 45, "right": 90, "back_right": 135,
+          "back": 180, "back_left": 225, "left": 270, "front_left": 315}
+BELT_HALF_WIDTH = 0.16   # m, for eye height 1.56 m; scaled with it
+BELT_HALF_DEPTH = 0.11
+
+
+def preset_distance(angle_deg, eye):
+    """How far the belt is from the body centre in this direction (polar angle, clockwise from in front):
+    the belt is an ellipse, half-width × half-depth, scaled with her height."""
+    a = BELT_HALF_WIDTH * eye / 1.56
+    d = BELT_HALF_DEPTH * eye / 1.56
+    t = np.radians(angle_deg)
+    return float(a * d / np.hypot(d * np.sin(t), a * np.cos(t)))
+
+def mount_offset(angle_deg, dist):
+    """From the tracker (at `angle_deg` around the body, `dist` m from its centre) to the centre,
+    as (right, forward) metres. Flat: the centre is at the tracker's own height, so a tracker tilting
+    with the flesh (side of the hip when sitting) can't drag the waist sideways (2026-11-14)."""
+    a = np.radians(angle_deg)
+    return -dist * np.sin(a), -dist * np.cos(a)
+
+
+def mount_body_vector(angle_deg, dist):
+    """The same as a vector in the body frame (x right, y up, z back)."""
+    r, f = mount_offset(angle_deg, dist)
+    return np.array([r, 0.0, -f])
+
+
+def mount_centre(tracker_pos, mount, fwd, right):
+    """The body centre for a tracker at mount = (angle_deg, dist), in world space (facing fwd/right)."""
+    r, f = mount_offset(*mount)
+    return np.asarray(tracker_pos, float) + r * np.asarray(right) + f * np.asarray(fwd)
+
+
+def sit_fix(pivot, final, roll_bias, sit_pitch):
+    """Takes off the sideways roll a side-of-belt tracker picks up from sitting, and only that.
+
+    `roll_bias` (rad) is the roll the final waist showed while she sat upright (learned once);
+    `sit_pitch` (rad) the pelvis tilt it had then. The share removed grows with how far the pelvis is
+    tilted back now (0 standing, all of it when sitting like then), so a real sideways lean — standing
+    or sitting — still reaches the avatar. Turned about `pivot` (the tracker). Mirror of sit_fix() in
+    the Monado bridge (fbtcal.hpp) — keep both the same.
+    """
+    pos, q = final
+    fwd = q_rot(q, [0.0, 0.0, -1.0])
+    if sit_pitch <= 1e-3:
+        return final
+    pitch = np.arcsin(np.clip(fwd[1], -1.0, 1.0))
+    share = float(np.clip(pitch / sit_pitch, 0.0, 1.0))
+    a = -roll_bias * share
+    # turn about her forward axis; a positive roll lifts the right side
+    corr = np.concatenate([[np.cos(a / 2)], np.sin(a / 2) * (-fwd)])
+    corr = q_norm(corr)
+    return np.asarray(pivot) + q_rot(corr, np.asarray(pos) - np.asarray(pivot)), q_norm(q_mul(corr, q))
+
+
+
+def detect_mount(head, tracker_pos, fwd, right, eye):
+    """Where on the belt the waist tracker hangs, measured while she stands: the angle of the tracker
+    around the body axis (under the neck), clockwise from straight in front, from the body's facing.
+    The distance to the body centre is the belt size for her height. On her calibrations (2026-11-14)
+    this gave 41–56°, the 45° («front_right») she had chosen by hand."""
+    n = neck(head)
+    v = np.asarray(tracker_pos, float) - n
+    angle = float(np.degrees(np.arctan2(v @ np.asarray(right), v @ np.asarray(fwd))) % 360)
+    return angle, preset_distance(angle, eye)
+
+
+PLACE_NAMES = {"front": "спереду", "front_right": "спереду-справа", "right": "справа", "back_right": "ззаду-справа",
+               "back": "ззаду", "back_left": "ззаду-зліва", "left": "зліва", "front_left": "спереду-зліва"}
+
+
+def place_name(angle):
+    """«спереду-справа» etc. for an angle around the belt."""
+    best = min(MOUNTS, key=lambda m: abs((angle - MOUNTS[m] + 180) % 360 - 180))
+    return PLACE_NAMES[best]
