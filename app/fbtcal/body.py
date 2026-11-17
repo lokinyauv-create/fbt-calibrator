@@ -249,33 +249,6 @@ def standing_ok(head, trackers, roles):
     return True, ""
 
 
-def level_roll(pivot, final):
-    """The final pose without its sideways roll, turned about `pivot` (the tracker itself).
-
-    For a waist tracker worn on the side of the belt: it tilts sideways with flesh and clothes when
-    she sits (≈8°, 2026-11-14), and the long lever to the body centre made the whole body slide
-    sideways. Forward/back tilt and turning are kept. Mirror of level_roll() in the Monado bridge
-    (fbtcal.hpp) — keep both the same.
-    """
-    pos, q = final
-    fwd = q_rot(q, [0.0, 0.0, -1.0])
-    right = np.cross(fwd, UP)
-    n = np.linalg.norm(right)
-    if n < 1e-3:
-        return final
-    right = right / n
-    back = -fwd
-    up = np.cross(back, right)
-    level = mat_to_pose(np.column_stack([right, up, back, np.zeros(3)]))[1]
-    corr = q_mul(level, q_conj(q))
-    return np.asarray(pivot) + q_rot(corr, np.asarray(pos) - np.asarray(pivot)), level
-
-
-def final_pose(real, off, sitfix=None):
-    """The pose apps get for a tracker: real * offset; for the waist on Monado the sitting roll is
-    taken off (`sitfix` = (roll_bias, sit_pitch) in rad, see sit_fix)."""
-    f = compose(real, off)
-    return sit_fix(real[0], f, *sitfix) if sitfix else f
 
 
 # Where the waist tracker can hang, seen from above: angle from straight in front, clockwise (to her right).
@@ -313,28 +286,6 @@ def mount_centre(tracker_pos, mount, fwd, right):
     return np.asarray(tracker_pos, float) + r * np.asarray(right) + f * np.asarray(fwd)
 
 
-def sit_fix(pivot, final, roll_bias, sit_pitch):
-    """Takes off the sideways roll a side-of-belt tracker picks up from sitting, and only that.
-
-    `roll_bias` (rad) is the roll the final waist showed while she sat upright (learned once);
-    `sit_pitch` (rad) the pelvis tilt it had then. The share removed grows with how far the pelvis is
-    tilted back now (0 standing, all of it when sitting like then), so a real sideways lean — standing
-    or sitting — still reaches the avatar. Turned about `pivot` (the tracker). Mirror of sit_fix() in
-    the Monado bridge (fbtcal.hpp) — keep both the same.
-    """
-    pos, q = final
-    fwd = q_rot(q, [0.0, 0.0, -1.0])
-    if sit_pitch <= 1e-3:
-        return final
-    pitch = np.arcsin(np.clip(fwd[1], -1.0, 1.0))
-    share = float(np.clip(pitch / sit_pitch, 0.0, 1.0))
-    a = -roll_bias * share
-    # turn about her forward axis; a positive roll lifts the right side
-    corr = np.concatenate([[np.cos(a / 2)], np.sin(a / 2) * (-fwd)])
-    corr = q_norm(corr)
-    return np.asarray(pivot) + q_rot(corr, np.asarray(pos) - np.asarray(pivot)), q_norm(q_mul(corr, q))
-
-
 
 def detect_mount(head, tracker_pos, fwd, right, eye):
     """Where on the belt the waist tracker hangs, measured while she stands: the angle of the tracker
@@ -355,3 +306,4 @@ def place_name(angle):
     """«спереду-справа» etc. for an angle around the belt."""
     best = min(MOUNTS, key=lambda m: abs((angle - MOUNTS[m] + 180) % 360 - 180))
     return PLACE_NAMES[best]
+

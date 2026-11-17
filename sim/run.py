@@ -5,7 +5,6 @@
 
 What happens for her: VRChat's calibration starts, the app measures her on the spot and freezes the
 trackers, VRChat lets go — then the avatar's hips are checked against the body in a few poses.
-Sitting and leaning with a side tracker: sim/sitting.py.
 """
 import sys
 import time

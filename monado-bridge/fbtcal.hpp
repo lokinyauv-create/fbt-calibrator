@@ -35,68 +35,8 @@ constexpr uint32_t DEV_MAGIC = 0x46424d32u;  // "FBM2"
 constexpr int MAX_SLOTS = 8;
 constexpr int MAX_DEVS = 24;
 
-enum Mode : uint32_t { PASSTHROUGH = 0, OFFSET = 1, OVERRIDE = 2, BALANCED = 3 };
+enum Mode : uint32_t { PASSTHROUGH = 0, OFFSET = 1, OVERRIDE = 2 };
 
-/*!
- * BALANCED (the waist, 2026-11-14 04:10): like OFFSET, but the sideways roll a side-of-belt tracker picks
- * up FROM SITTING is taken off: ovPos[0] = that roll (rad, learned while she sat upright), ovPos[1] = the
- * pelvis tilt it had then (rad). The share removed grows with how far the pelvis is tilted back now
- * (0 standing, all of it sitting), so real sideways leans still reach the avatar (removing all roll, as
- * level_roll did, broke the avatar when she leaned). Mirrored in app/fbtcal/body.py sit_fix().
- */
-inline void
-sit_fix(const xrt_vec3 &pivot, xrt_pose &fin, float roll_bias, float sit_pitch)
-{
-	if (sit_pitch <= 1e-3f) {
-		return;
-	}
-	xrt_vec3 fwd{0.f, 0.f, -1.f};
-	math_quat_rotate_vec3(&fin.orientation, &fwd, &fwd);
-	const float pitch = std::asin(std::fmax(-1.f, std::fmin(1.f, fwd.y)));
-	const float share = std::fmax(0.f, std::fmin(1.f, pitch / sit_pitch));
-	const float a = -roll_bias * share;
-	const float s = std::sin(a / 2.f);
-	xrt_quat corr{-fwd.x * s, -fwd.y * s, -fwd.z * s, std::cos(a / 2.f)};
-	math_quat_normalize(&corr);
-	xrt_vec3 arm{fin.position.x - pivot.x, fin.position.y - pivot.y, fin.position.z - pivot.z};
-	math_quat_rotate_vec3(&corr, &arm, &arm);
-	fin.position = {pivot.x + arm.x, pivot.y + arm.y, pivot.z + arm.z};
-	xrt_quat q;
-	math_quat_rotate(&corr, &fin.orientation, &q);
-	fin.orientation = q;
-}
-
-/*!
- * (old, unused) level_roll: removed ALL sideways roll. A tracker worn on
- * the side of the belt tilts with the flesh and clothes when she sits (≈8° measured 2026-11-14), and the
- * long lever to the body centre turned that into the whole body sliding sideways. Forward/back tilt and
- * turning are kept. The point turns about the tracker, so the tracker itself stays where it is.
- * Mirrored in app/fbtcal/body.py level_roll() — keep both the same.
- */
-inline void
-level_roll(const xrt_vec3 &pivot, xrt_pose &fin)
-{
-	xrt_vec3 fwd{0.f, 0.f, -1.f};
-	math_quat_rotate_vec3(&fin.orientation, &fwd, &fwd);
-	xrt_vec3 up{0.f, 1.f, 0.f};
-	xrt_vec3 right;
-	math_vec3_cross(&fwd, &up, &right);
-	const float n = std::sqrt(right.x * right.x + right.y * right.y + right.z * right.z);
-	if (n < 1e-3f) {
-		return; // facing straight up or down: no sideways direction to level
-	}
-	right = {right.x / n, right.y / n, right.z / n};
-	xrt_vec3 back{-fwd.x, -fwd.y, -fwd.z};
-	xrt_quat level;
-	math_quat_from_plus_x_z(&right, &back, &level);
-	xrt_quat inv, corr;
-	math_quat_invert(&fin.orientation, &inv);
-	math_quat_rotate(&level, &inv, &corr);
-	xrt_vec3 arm{fin.position.x - pivot.x, fin.position.y - pivot.y, fin.position.z - pivot.z};
-	math_quat_rotate_vec3(&corr, &arm, &arm);
-	fin.position = {pivot.x + arm.x, pivot.y + arm.y, pivot.z + arm.z};
-	fin.orientation = level;
-}
 enum Kind : uint32_t { NONE = 0, HMD = 1, LEFT = 2, RIGHT = 3, TRACKER = 4, OTHER = 5 };
 
 #pragma pack(push, 8)
@@ -233,7 +173,7 @@ public:
 			p.orientation = {float(s.ovRot[1]), float(s.ovRot[2]), float(s.ovRot[3]), float(s.ovRot[0])};
 			return OVERRIDE;
 		}
-		if (s.mode == OFFSET || s.mode == OVERRIDE || s.mode == BALANCED) {
+		if (s.mode == OFFSET || s.mode == OVERRIDE) {
 			xrt_pose off;
 			off.position = {float(s.offPos[0]), float(s.offPos[1]), float(s.offPos[2])};
 			off.orientation = {float(s.offRot[1]), float(s.offRot[2]), float(s.offRot[3]), float(s.offRot[0])};
@@ -245,12 +185,7 @@ public:
 				math_vec3_cross(ang_vel, &arm, &extra);
 				math_vec3_accum(&extra, lin_vel);
 			}
-			const xrt_vec3 tracker = p.position;
 			math_pose_transform(&p, &off, &p);
-			if (s.mode == BALANCED) {
-				sit_fix(tracker, p, float(s.ovPos[0]), float(s.ovPos[1]));
-				return BALANCED;
-			}
 			return OFFSET;
 		}
 		return 0;

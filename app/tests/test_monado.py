@@ -175,28 +175,6 @@ def test_switching_our_calibration_off_passes_the_trackers_through():
     assert c.override is None                                 # and no freeze
 
 
-def test_sitting_roll_is_learned_only_from_upright_sitting():
-    body = Body(eye=1.56, seed=12, waist_mount=(0.16, 0.05, -0.02))
-    c, _ = vrchat_press(body, body.pose())
-    c.override = None
-    c.say = lambda *a, **k: None
-    w = (c.last_real["W"][0] - np.array([0.0, 0.40, 0.0]), c.last_real["W"][1])   # on a chair: pelvis 40 cm lower
-    rigid0 = b.compose(w, c.cal["W"]["off"])
-    head = (rigid0[0] + np.array([0.0, 0.66, 0.0]), np.array([1.0, 0, 0, 0]))   # head ~1.13 m, over the pelvis
-    q = lambda pitch, roll: b.q_mul(np.array([np.cos(pitch / 2), np.sin(pitch / 2), 0, 0]),
-                                    np.array([np.cos(roll / 2), 0, 0, np.sin(roll / 2)]))
-    t = 1000.0
-    for i in range(150):                      # lying on her side: big roll, must not be learned
-        real_q = b.q_mul(q(np.radians(30), np.radians(60)), b.q_conj(c.cal["W"]["off"][1]))
-        c.learn_sitting(head, {"W": (w[0], real_q)}, t := t + 0.11)
-    assert c.settings.get("sit_roll_bias_deg") is None
-    for i in range(150):                      # sitting upright, the tracker rolled 8° by the flesh
-        real_q = b.q_mul(q(np.radians(25), np.radians(8)), b.q_conj(c.cal["W"]["off"][1]))
-        c.learn_sitting(head, {"W": (w[0], real_q)}, t := t + 0.11)
-    assert abs(c.settings["sit_roll_bias_deg"] - 8) < 1.0 and abs(c.settings["sit_pitch_deg"] - 25) < 1.5
-
-
-
 def test_the_devices_monado_publishes_are_read_back(tmp_path, monkeypatch):
     path = tmp_path / "devs"
     monkeypatch.setattr(shm, "DEV_NAME", str(path))
@@ -232,25 +210,3 @@ def test_a_tracker_switched_off_is_named(monkeypatch):
     del c.last_real["L"]                                  # then the left foot tracker goes off
     c.start_override("VRChat calibration")
     assert c.override is None and said and "Ліва нога" in said[-1]
-
-
-def test_i_am_sitting_straight_takes_the_tilt_at_once():
-    body = Body(eye=1.56, seed=15, waist_mount=(0.16, 0.05, -0.02))
-    c, _ = vrchat_press(body, body.pose())
-    c.override = None
-    said = []
-    c.say = lambda text, secs=0: said.append(text)
-    c.sit_straight()                                          # standing: not now
-    assert "Сядь рівно" in said[-1] and c.settings.get("sit_roll_bias_deg") is None
-    w = (c.last_real["W"][0] - np.array([0.0, 0.40, 0.0]), c.last_real["W"][1])
-    rigid0 = b.compose(w, c.cal["W"]["off"])
-    head = (rigid0[0] + np.array([0.0, 0.66, 0.0]), np.array([1.0, 0, 0, 0]))
-    q = b.q_mul(np.array([np.cos(np.radians(12.5)), np.sin(np.radians(12.5)), 0, 0]),
-                np.array([np.cos(np.radians(3)), 0, 0, np.sin(np.radians(3))]))   # tilt 25°, roll 6°
-    real_q = b.q_mul(q, b.q_conj(c.cal["W"]["off"][1]))
-    import time as _t
-    for _ in range(12):                                       # a second of sitting upright
-        c.learn_sitting(head, {"W": (w[0], real_q)}, _t.monotonic())
-        _t.sleep(0.11)
-    c.sit_straight()
-    assert abs(c.settings["sit_roll_bias_deg"] - 6) < 1.0 and "Запам'ятала" in said[-1]

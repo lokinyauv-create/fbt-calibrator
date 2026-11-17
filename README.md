@@ -13,7 +13,6 @@ Full-body tracker calibration for **Linux** (SteamVR and Monado), inspired by [S
 - **Measured on the spot.** When VRChat's calibration starts and you stand straight, the app measures your **height** from the headset, finds which tracker is the waist and which are the feet, takes your **body's facing from your arms** (your head may look a little aside), and works out **where the waist tracker hangs** — front, side, back or anywhere between. The feet stay where you keep them.
 - **Nothing jumps.** The trackers are held in an ideal T-pose until VRChat lets go, built from the same numbers, so the avatar does not jump afterwards — whatever height VRChat thinks you are.
 - **Sitting or lying?** Then the last calibration is used.
-- **Side-of-belt tracker (Monado).** Such a tracker tilts with the flesh when you sit, which tilted the avatar's pelvis. The app learns that tilt while you sit upright and takes off only that part, so real sideways leans still reach the avatar. **«I'm sitting straight»** takes it at once.
 - **Two switches:** *Our calibration* (turn off to compare with the plain trackers) and *Tracker models* (3D VIVE Tracker models in VR, in the [WayVR Monado build](https://github.com/lokinyauv-create/wayvr)).
 - **Voice hints** (Ukrainian): e.g. which tracker it cannot see.
 - **Updates:** pick any published version (newer or older) in the window, or let it update by itself while VR is off.
@@ -58,9 +57,9 @@ What to know:
 ## How it works
 
 - `driver/` is a tiny SteamVR driver (`fbtcal`). It hooks `IVRServerDriverHost::TrackedDevicePoseUpdated` and rewrites the **real** trackers' poses in place. It adds no virtual trackers and hides nothing. The calibration offset is folded into the pose's driver-from-head transform, so SteamVR's own prediction stays correct. The driver publishes the untouched poses and reads the offsets through shared memory (`/dev/shm/fbtcal-v1`).
-- `monado-bridge/` is the same idea for Monado: a header for its `steamvr_lh` driver that publishes every device's real pose (`/dev/shm/fbtcal-devices-v2`) and applies the offsets (including the sitting fix) where Lighthouse poses enter Monado.
-- `app/` is the tray app (Python, PySide6, pyopenvr): the automatic calibration, the body model, the sitting learning, VRChat log watching, updates.
-- `sim/` is a virtual body with three trackers used to test the whole flow (heights, bodies, belt spots, sitting and leaning); `app/tests/` runs it.
+- `monado-bridge/` is the same idea for Monado: a header for its `steamvr_lh` driver that publishes every device's real pose (`/dev/shm/fbtcal-devices-v2`) and applies the offsets where Lighthouse poses enter Monado.
+- `app/` is the tray app (Python, PySide6, pyopenvr): the automatic calibration, the body model, VRChat log watching, updates.
+- `sim/` is a virtual body with three trackers used to test the whole flow (heights, bodies, belt spots); `app/tests/` runs it.
 - Other drivers can move trackers after ours. Space Calibrator does this, and our raw poses were 3.85 m and 153° away from the Quest headset. So the app works in the space games see: it takes its own device-local offset back off the final pose. It also measures what the other drivers add, so the frozen VRChat T-pose still lands in the right place.
 - VRChat detection reads VRChat's own log (IK Debug Logging): `Calibrate FBT and reload avatar…` / `Preparing for calibration…` start it, and `Restore tracking…` ends it.
 - Files live in `~/.config/fbt-calibrator/`: the calibration, settings and a log.

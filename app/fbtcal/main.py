@@ -24,7 +24,7 @@ from . import body as B
 from . import update
 from .i18n import tr
 from .version import REPO, VERSION
-from .shm import BALANCED, HMD, LEFT, OFFSET, OVERRIDE, PASSTHROUGH, RIGHT, TRACKER, MonadoDevices, Shm
+from .shm import HMD, LEFT, OFFSET, OVERRIDE, PASSTHROUGH, RIGHT, TRACKER, MonadoDevices, Shm
 from .vrchat_log import VrchatLogWatcher
 
 CONFIG = Path.home() / ".config/fbt-calibrator"
@@ -153,68 +153,6 @@ class Calibrator:
         """Where the waist tracker hangs, as measured at the last calibration: (angle°, distance m)."""
         return next((c.get("mount") for c in self.cal.values() if c["role"] == "waist"), None)
 
-    # her side-of-belt tracker rolled +7.6° when she sat (2026-11-14); learned on, see learn_sitting()
-    SIT_ROLL_DEFAULT, SIT_PITCH_DEFAULT = 7.6, 25.0
-
-    def balanced(self, c):
-        """(roll_bias, sit_pitch) rad for the waist: the sitting roll taken off (Monado bridge only; the
-        SteamVR driver has no such mode). None for other trackers / switched off."""
-        if not (c["role"] == "waist" and self.settings.get("balanced_waist", True) and getattr(self, "monado_on", False)):
-            return None
-        return (np.radians(self.settings.get("sit_roll_bias_deg", self.SIT_ROLL_DEFAULT)),
-                np.radians(self.settings.get("sit_pitch_deg", self.SIT_PITCH_DEFAULT)))
-
-    def learn_sitting(self, head, trackers_real, now):
-        """Learns how much the side tracker rolls when she sits upright: the median over the last minute
-        of upright sitting (leans to both sides even out; slouching or lying is not counted)."""
-        c = next(((s, c) for s, c in self.cal.items() if c["role"] == "waist"), None)
-        if not c or c[0] not in trackers_real or not self.eye or head is None:
-            return
-        hist = self.__dict__.setdefault("sit_hist", [])
-        if hist and now - hist[-1][0] < 0.1:
-            return  # 10 samples a second are plenty
-        rigid = B.compose(trackers_real[c[0]], c[1]["off"])
-        m = B.pose_to_mat(np.zeros(3), rigid[1])[:, :3]
-        roll = float(np.degrees(np.arcsin(np.clip(m[:, 0][1], -1, 1))))
-        pitch = float(np.degrees(np.arcsin(np.clip(-m[:, 2][1], -1, 1))))
-        up = head[0] - rigid[0]
-        sitting = (0.55 * self.eye < head[0][1] < 0.85 * self.eye        # head at sitting height
-                   and up[1] > 0.45 and np.hypot(up[0], up[2]) < 0.25     # torso upright over the pelvis
-                   and 12 < pitch < 50 and abs(roll) < 20)                # pelvis tilted like sitting, not lying
-        if not sitting:
-            return
-        hist.append((now, roll, pitch))
-        self.__dict__["sit_last"] = (now, roll, pitch)
-        del hist[:max(0, len(hist) - 600)]
-        if len(hist) < 100 or now - self.__dict__.get("sit_pushed", 0.0) < 5.0:
-            return
-        st = self.settings
-        st["sit_roll_bias_deg"] = float(np.clip(np.median([h[1] for h in hist]), -12.0, 12.0))
-        st["sit_pitch_deg"] = float(np.clip(np.median([h[2] for h in hist]), 15.0, 45.0))
-        self.__dict__["sit_pushed"] = now
-        self.push_slots()
-        if now - self.__dict__.get("sit_saved", 0.0) > 30.0:
-            self.__dict__["sit_saved"] = now
-            save_json(SETTINGS_FILE, st)
-            log("sitting roll %.1f°, sitting pelvis tilt %.0f° (%d samples)" % (st["sit_roll_bias_deg"], st["sit_pitch_deg"], len(hist)))
-
-    def sit_straight(self):
-        """«Я сиджу рівно»: take how the tracker sits right now (last second and a half of upright
-        sitting) as the sitting roll at once, instead of waiting for the slow learning."""
-        now = time.monotonic()
-        recent = [(r, p) for t, r, p in self.__dict__.get("sit_hist", []) if now - t < 1.5]
-        if len(recent) < 8:
-            self.say("Сядь рівно і натисни ще раз", 8.0)
-            log("sit straight: she is not sitting upright now")
-            return
-        st = self.settings
-        st["sit_roll_bias_deg"] = float(np.clip(np.median([r for r, _ in recent]), -12.0, 12.0))
-        st["sit_pitch_deg"] = float(np.clip(np.median([p for _, p in recent]), 15.0, 45.0))
-        save_json(SETTINGS_FILE, st)
-        self.push_slots()
-        self.say(f"Запам'ятала, як ти сидиш: нахил {st['sit_roll_bias_deg']:+.0f}°", 8.0)
-        log("sit straight: sitting roll %.1f°, tilt %.0f°" % (st["sit_roll_bias_deg"], st["sit_pitch_deg"]))
-
     def active(self):
         """«Наша калібровка» switch: off = the trackers go to VRChat exactly as they are (to compare)."""
         return bool(self.settings.get("enabled", True))
@@ -225,10 +163,7 @@ class Calibrator:
             self.shm.write_slots([])  # passthrough: no offsets, no freeze
             return
         for serial, c in self.cal.items():
-            fix = self.balanced(c)
-            s = {"serial": serial, "mode": BALANCED if fix else OFFSET, "off": c["off"]}
-            if fix:  # the bridge reads the sitting roll and tilt from the override fields
-                s["ov"] = (np.array([fix[0], fix[1], 0.0]), np.array([1.0, 0, 0, 0]))
+            s = {"serial": serial, "mode": OFFSET, "off": c["off"]}
             if self.override and serial in self.override:
                 s["mode"] = OVERRIDE
                 s["ov"] = self.override[serial]
@@ -308,7 +243,6 @@ class Calibrator:
             self.std_from_raw = NO_FIX if alive else None
             self.world_fix = {}
             log("connected to Monado" if alive else "Monado closed")
-            self.push_slots()  # the waist gets its Monado-only balanced mode
         if not alive:
             return
         head = left = right = None
@@ -324,7 +258,7 @@ class Calibrator:
             elif d["kind"] == TRACKER:
                 trackers_real[d["serial"]] = p
                 c = self.cal.get(d["serial"])
-                final[d["serial"]] = B.final_pose(p, c["off"], self.balanced(c)) if c else p
+                final[d["serial"]] = B.compose(p, c["off"]) if c else p
         self.status = {"driver": True, "seen": set(trackers_real), "final": final}
         self.last_real = trackers_real
         self.last_hands = (left, right)
@@ -332,8 +266,6 @@ class Calibrator:
             return
         self.last_head = head
         now = time.monotonic()
-        if not self.override and self.active():
-            self.learn_sitting(head, trackers_real, now)
         if self.override and now > self.override_until:
             self.end_override()
         elif self.override:
@@ -514,7 +446,7 @@ class Calibrator:
         for serial, c in self.cal.items():
             if c["role"] != "waist" or serial not in self.last_real:
                 continue
-            follow = B.final_pose(self.last_real[serial], c["off"], self.balanced(c))
+            follow = B.compose(self.last_real[serial], c["off"])
             want = model["waist"]
             d = follow[0] - want[0]
             if np.hypot(d[0], d[2]) < 0.15 and abs(d[1]) < 0.20:
@@ -726,11 +658,6 @@ class Window(QWidget):
         self.dots.toggled.connect(lambda v: self.set("dots", v))
         lay.addWidget(self.dots)
 
-        sit = QPushButton(tr("sit_straight"))
-        sit.setToolTip(tr("sit_tip"))
-        sit.clicked.connect(cal.sit_straight)
-        lay.addWidget(sit)
-
         self.info = QLabel()
         self.info.setWordWrap(True)
         lay.addWidget(self.info)
@@ -824,8 +751,6 @@ def handle_watch_commands(cal, win):
         log(f"watch command: {' '.join(cmd)}")
         if cmd[:2] == ["toggle", "enabled"]:
             win.enabled.setChecked(not win.enabled.isChecked())
-        elif cmd[:2] == ["sit", "straight"]:
-            cal.sit_straight()
         elif cmd[:2] == ["toggle", "dots"]:
             win.dots.setChecked(not win.dots.isChecked())
         elif cmd[:1] == ["show"]:

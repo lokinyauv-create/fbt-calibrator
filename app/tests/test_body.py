@@ -79,40 +79,5 @@ def test_t_pose_facing_comes_from_the_hands_not_the_head():
     assert abs(b.compose(trackers["L"], cal["L"]["off"])[0][2] - b.compose(trackers["R"], cal["R"]["off"])[0][2]) < 1e-9
 
 
-def test_level_roll_keeps_the_tracker_and_removes_only_the_sideways_roll():
-    rng = np.random.default_rng(11)
-    real = (np.array([0.16, 0.95, 0.0]), b.q_norm(rng.normal(size=4)))
-    off = (np.array([-0.03, 0.10, 0.17]), b.q_norm(rng.normal(size=4)))
-    f = b.compose(real, off)
-    pos, q = b.level_roll(real[0], f)
-    right, up, fwd = b.q_rot(q, [1, 0, 0]), b.q_rot(q, [0, 1, 0]), b.q_rot(q, [0, 0, -1])
-    assert abs(right[1]) < 1e-9                                        # no sideways roll left
-    assert np.allclose(fwd, b.q_rot(f[1], [0, 0, -1]), atol=1e-9)      # facing and forward tilt kept
-    assert abs(np.linalg.norm(pos - real[0]) - np.linalg.norm(f[0] - real[0])) < 1e-9  # turned about the tracker
-    # a pose that does not roll is left alone
-    level = b.level_roll(real[0], (pos, q))
-    assert np.allclose(level[0], pos, atol=1e-9) and abs(abs(np.dot(level[1], q)) - 1) < 1e-9
 
 
-def test_sit_fix_takes_off_the_sitting_roll_but_keeps_real_leans():
-    """sim/sitting.py: rigid 7.4°, «level» 6° (killed real leans), sit_fix ≤ ~1° error."""
-    import sys
-    from pathlib import Path
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "sim"))
-    import sitting as S
-    from humanoid import Body
-    rng = np.random.default_rng(2)
-    body = Body(waist_mount=(0.16, 0.05, -0.02))
-    real0 = S.tracker(body, 0.0, 0.0, rng)
-    off = b.compose(b.inverse(real0), (body.pelvis0, np.array([1.0, 0, 0, 0])))
-    sit = b.compose(S.tracker(body, S.SIT_PITCH, 0.0, rng), off)
-    fix = (np.radians(S.roll_of(sit[1])), np.radians(S.pitch_of(sit[1])))
-    for pitch, roll in ((0, 0), (0, -6), (0, 6), (25, 0), (25, -6), (25, 6), (12, 0)):
-        real = S.tracker(body, np.radians(pitch), np.radians(roll), rng)
-        out = b.final_pose(real, off, fix)
-        assert abs(S.roll_of(out[1]) - roll) < 1.5, (pitch, roll)
-        assert np.allclose(out[0] - real[0], out[0] - real[0])
-    # the tracker itself stays put: the waist point turns about it
-    real = S.tracker(body, np.radians(25), 0.0, rng)
-    rigid, out = b.compose(real, off), b.final_pose(real, off, fix)
-    assert abs(np.linalg.norm(out[0] - real[0]) - np.linalg.norm(rigid[0] - real[0])) < 1e-9

@@ -35,7 +35,7 @@ fbtcal::Bridge::get().publish(serial, fbt_kind, true, fbt_real, relation.pose);
 ```
 
 It publishes every device's real and final pose to `/dev/shm/fbtcal-devices-v2` and applies what the app
-writes to `/dev/shm/fbtcal-v1` (offsets, the VRChat freeze, and for the waist the sitting fix).
+writes to `/dev/shm/fbtcal-v1` (offsets and the VRChat freeze).
 Tested on a Monado 25.1 fork (`steamvr_lh` with controller hot-plug), Valve Index + VIVE Tracker 3.0.
 
 Monado не вміє завантажувати драйвери SteamVR, тому калібрування робиться там, де пози Lighthouse
